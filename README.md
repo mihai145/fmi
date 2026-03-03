@@ -80,6 +80,8 @@ The architecture of the system, including a comparison with existing systems and
 
 A technical documentation of the system (for people that want to extend it) is available at [fmi.opencore.ch](https://fmi.opencore.ch).
 
+## HPC for free (TODO...)
+
 ## Authors
 
 * [Marcin Copik (ETH Zurich)](https://github.com/mcopik/) - maintainer.
