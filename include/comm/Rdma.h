@@ -101,6 +101,7 @@ namespace FMI::Comm
         rdmalib::Buffer<rdmalib::RemoteBuffer> rbuf_info_buffer;
 
         ActiveConnection(const std::string &ip, int port);
+        ActiveConnection(ActiveConnection &&obj);
 
         void post_recv_rbuf_info();
     };

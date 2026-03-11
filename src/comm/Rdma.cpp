@@ -6,6 +6,8 @@
 
 constexpr int RDMA_LISTEN_PORT_OFFSET = 11005;
 constexpr int RDMA_LISTEN_PORT_RANGE = 10000;
+constexpr int RDMA_CONNECT_RETRIES = 5;
+constexpr std::chrono::milliseconds RDMA_CONNECT_BACKOFF = std::chrono::milliseconds(10);
 constexpr uint32_t RDMA_WRITE_WITH_IMMEDIATE_CT = 42;
 
 FMI::Comm::Rdma::Rdma(std::map<std::string, std::string> params) : shutdown{false}, local_ip{"localhost"}, rdma_listen_port{-1}
@@ -372,18 +374,25 @@ void FMI::Comm::Rdma::recv_rdma_conn_info(int partner_socket, RdmaConnInfo *conn
 
 void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo &conn_info)
 {
-    active_connections.emplace(std::piecewise_construct, std::forward_as_tuple(partner_id), std::forward_as_tuple(conn_info.ip, conn_info.rdma_port));
-
     BOOST_LOG_TRIVIAL(info) << peer_id << ": connecting to partner " << partner_id << " at ip " << conn_info.ip << " and rdma port " << conn_info.rdma_port;
 
-    if (!active_connections.at(partner_id).active.connect(peer_id))
+    for (int i = 0; i < RDMA_CONNECT_RETRIES; i++)
     {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": could not connect to partner " << partner_id;
+        ActiveConnection conn(conn_info.ip, conn_info.rdma_port);
+
+        if (conn.active.connect(peer_id))
+        {
+            active_connections.emplace(partner_id, std::move(conn));
+            BOOST_LOG_TRIVIAL(info) << peer_id << ": connected to partner " << partner_id << " after " << i << " retries";
+            return;
+        }
+
+        BOOST_LOG_TRIVIAL(warning) << peer_id << ": could not connect to partner " << partner_id << ", retrying...";
+        std::this_thread::sleep_for(RDMA_CONNECT_BACKOFF);
     }
-    else
-    {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": connected to partner " << partner_id;
-    }
+
+    BOOST_LOG_TRIVIAL(error) << peer_id << ": could not connect to partner " << partner_id;
+    throw std::runtime_error("could not connect to partner");
 }
 
 FMI::Comm::PassiveConnection::PassiveConnection(ibv_pd *pd, rdmalib::Connection *conn) : pd{pd}, conn{conn}, rts_buffer{1}, wimm_buffer{1}, buf_info_buffer{1}
@@ -408,6 +417,11 @@ FMI::Comm::ActiveConnection::ActiveConnection(const std::string &ip, int port) :
     active.allocate();
     rbuf_info_buffer.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
     len_buffer.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
+}
+
+FMI::Comm::ActiveConnection::ActiveConnection(ActiveConnection &&obj) : len_buffer{std::move(obj.len_buffer)}, rbuf_info_buffer{std::move(obj.rbuf_info_buffer)}
+{
+    active = std::move(obj.active);
 }
 
 void FMI::Comm::ActiveConnection::post_recv_rbuf_info()
