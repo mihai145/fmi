@@ -34,6 +34,7 @@ set(FMI_SOURCES
     src/utils/ChannelPolicy.cpp
     src/comm/PeerToPeer.cpp
     src/comm/Direct.cpp
+    src/comm/Rdma.cpp
 )
 
 if(FMI_BUILD_SHARED)
@@ -44,9 +45,9 @@ else()
     add_library(FMI STATIC ${FMI_SOURCES})
 endif()
 
-target_include_directories(FMI PRIVATE ${Boost_INCLUDE_DIRS} ${TCPUNCH_INCLUDE_DIRS})
+target_include_directories(FMI PRIVATE ${Boost_INCLUDE_DIRS} ${TCPUNCH_INCLUDE_DIRS} ${RDMALIB_INCLUDE_PATH})
 
-target_link_libraries(FMI ${Boost_Libraries} Boost::log ${AWSSDK_LINK_LIBRARIES} ${HIREDIS_LIBRARIES} tcpunch)
+target_link_libraries(FMI ${Boost_Libraries} Boost::log ${AWSSDK_LINK_LIBRARIES} ${HIREDIS_LIBRARIES} tcpunch rdmalib cereal)
 
 #find_package(OpenMP REQUIRED)
 
