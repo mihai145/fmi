@@ -2,6 +2,7 @@
 #define FMI_RDMA_H
 
 #include <atomic>
+#include <condition_variable>
 #include <rdmalib/rdmalib.hpp>
 #include <netinet/in.h>
 #include <thread>
@@ -54,6 +55,7 @@ namespace FMI::Comm
         std::thread listener_thread;
 
         std::mutex passive_map_mutex;
+        std::condition_variable passive_map_cv;
         std::map<int, PassiveConnection> passive_connections;
         std::map<int, ActiveConnection> active_connections;
 
@@ -72,7 +74,7 @@ namespace FMI::Comm
         void send_rdma_conn_info(int partner_socket);
         void recv_rdma_conn_info(int partner_socket, RdmaConnInfo *conn_info);
 
-        void initialize_passive_connection(int partner_id, rdmalib::Connection *conn);
+        void insert_passive_connection(int partner_id, rdmalib::Connection *conn);
         void remove_passive_connection(int partner_id);
 
         void initialize_active_connection(int partner_id, RdmaConnInfo &conn_info);

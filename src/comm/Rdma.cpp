@@ -133,7 +133,9 @@ void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
 
     check_connection(sender_id);
 
+    passive_map_mutex.lock();
     PassiveConnection &passive_conn = passive_connections.at(sender_id);
+    passive_map_mutex.unlock();
 
     // wait for RTS
     auto [wc_rts, ret_rts] = passive_conn.conn.get()->poll_wc(rdmalib::QueueType::RECV, true, 1);
@@ -231,23 +233,24 @@ void FMI::Comm::Rdma::listen_rdma()
         else if (conn_status == rdmalib::ConnectionStatus::REQUESTED)
         {
             BOOST_LOG_TRIVIAL(info) << peer_id << ": partner with id " << partner_id << " requested connection";
-            initialize_passive_connection(partner_id, conn);
+            listener->accept(conn);
         }
         else if (conn_status == rdmalib::ConnectionStatus::ESTABLISHED)
         {
             BOOST_LOG_TRIVIAL(info) << peer_id << ": partner with id " << partner_id << " connected";
+            insert_passive_connection(partner_id, conn);
         }
     }
 
     BOOST_LOG_TRIVIAL(info) << "Listener thread stops listening for rdmacm events";
 }
 
-void FMI::Comm::Rdma::initialize_passive_connection(int partner_id, rdmalib::Connection *conn)
+void FMI::Comm::Rdma::insert_passive_connection(int partner_id, rdmalib::Connection *conn)
 {
     std::lock_guard<std::mutex> lock(passive_map_mutex);
     passive_connections.emplace(std::piecewise_construct, std::forward_as_tuple(partner_id), std::forward_as_tuple(listener->pd(), conn));
     passive_connections.at(partner_id).post_recv_rts();
-    listener->accept(conn);
+    passive_map_cv.notify_one();
 }
 
 void FMI::Comm::Rdma::remove_passive_connection(int partner_id)
@@ -266,12 +269,14 @@ void FMI::Comm::Rdma::check_connection(int partner_id)
         connect_with_partner(partner_id);
 
     // passive connections are handled by listener thread
-    int has_passive_connection = 0;
     do
     {
-        std::lock_guard<std::mutex> lock(passive_map_mutex);
-        has_passive_connection = passive_connections.count(partner_id);
-    } while (!has_passive_connection);
+        std::unique_lock<std::mutex> lock(passive_map_mutex);
+        if (passive_connections.count(partner_id))
+            break;
+        else
+            passive_map_cv.wait(lock);
+    } while (true);
 }
 
 void FMI::Comm::Rdma::connect_with_partner(int partner_id)
