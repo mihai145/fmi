@@ -2,7 +2,10 @@
 #include "../../include/comm/S3.h"
 #include "../../include/comm/Redis.h"
 #include "../../include/comm/Direct.h"
+
+#if FMI_RDMA
 #include "../../include/comm/Rdma.h"
+#endif
 
 std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name, std::map<std::string, std::string> params,
                                                                     std::map<std::string, std::string> model_params) {
@@ -12,9 +15,13 @@ std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string 
         return std::make_shared<Redis>(params, model_params);
     } else if (name == "Direct") {
         return std::make_shared<Direct>(params, model_params);
-    } else if (name == "Rdma") {
+    }
+    #if FMI_RDMA
+    else if (name == "Rdma") {
         return std::make_shared<Rdma>(params);
-    } else {
+    }
+    #endif
+    else {
         throw std::runtime_error("Unknown channel name passed");
     }
 }

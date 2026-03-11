@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(FMI_BUILD_SHARED "Build FMI as a shared library" OFF)
+option(FMI_RDMA "Enable RDMA support in FMI" OFF)
+
 if(FMI_BUILD_SHARED)
     add_compile_definitions(BOOST_LOG_DYN_LINK)
 else()
@@ -34,8 +36,14 @@ set(FMI_SOURCES
     src/utils/ChannelPolicy.cpp
     src/comm/PeerToPeer.cpp
     src/comm/Direct.cpp
-    src/comm/Rdma.cpp
 )
+
+if(FMI_RDMA)
+    list(APPEND FMI_SOURCES src/comm/Rdma.cpp)
+    message(STATUS "Building FMI with RDMA")
+else()
+    message(STATUS "Building FMI without RDMA")
+endif()
 
 if(FMI_BUILD_SHARED)
     add_library(FMI SHARED ${FMI_SOURCES})
@@ -45,9 +53,15 @@ else()
     add_library(FMI STATIC ${FMI_SOURCES})
 endif()
 
-target_include_directories(FMI PRIVATE ${Boost_INCLUDE_DIRS} ${TCPUNCH_INCLUDE_DIRS} ${RDMALIB_INCLUDE_PATH})
+target_include_directories(FMI PRIVATE ${Boost_INCLUDE_DIRS} ${TCPUNCH_INCLUDE_DIRS})
 
-target_link_libraries(FMI ${Boost_Libraries} Boost::log ${AWSSDK_LINK_LIBRARIES} ${HIREDIS_LIBRARIES} tcpunch rdmalib cereal)
+target_link_libraries(FMI ${Boost_Libraries} Boost::log ${AWSSDK_LINK_LIBRARIES} ${HIREDIS_LIBRARIES} tcpunch)
+
+if(FMI_RDMA)
+    target_compile_definitions(FMI PRIVATE FMI_RDMA=1)
+    target_include_directories(FMI PRIVATE ${RDMALIB_INCLUDE_PATH})
+    target_link_libraries(FMI rdmalib cereal)
+endif()
 
 #find_package(OpenMP REQUIRED)
 
