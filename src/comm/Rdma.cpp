@@ -195,10 +195,13 @@ void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
 
 void FMI::Comm::Rdma::initialize_rdma_server()
 {
-    rdma_listen_port = RDMA_LISTEN_PORT_OFFSET + std::hash<std::string>{}(comm_name) % RDMA_LISTEN_PORT_RANGE + peer_id; // random offset port based on hash of communicator name
-    int recv_buf_size = 2;                                                                                               // RTS + WriteWithImmediate
+    int recv_buf_size = 2; // RTS + WriteWithImmediate
 
-    listener = std::make_unique<rdmalib::RDMAPassive>(local_ip, rdma_listen_port, recv_buf_size, true);
+    // TODO: ports will be assigned by coordinator
+    rdma_listen_port = RDMA_LISTEN_PORT_OFFSET + peer_id;
+    listener = std::make_unique<rdmalib::RDMAPassive>(
+        local_ip, rdma_listen_port, recv_buf_size, true);
+
     listener_thread = std::thread(&Rdma::listen_rdma, this);
 }
 
@@ -242,7 +245,7 @@ void FMI::Comm::Rdma::listen_rdma()
 void FMI::Comm::Rdma::initialize_passive_connection(int partner_id, rdmalib::Connection *conn)
 {
     std::lock_guard<std::mutex> lock(passive_map_mutex);
-    passive_connections.emplace(partner_id, PassiveConnection(listener->pd(), conn));
+    passive_connections.emplace(std::piecewise_construct, std::forward_as_tuple(partner_id), std::forward_as_tuple(listener->pd(), conn));
     passive_connections.at(partner_id).post_recv_rts();
     listener->accept(conn);
 }
@@ -273,39 +276,47 @@ void FMI::Comm::Rdma::check_connection(int partner_id)
 
 void FMI::Comm::Rdma::connect_with_partner(int partner_id)
 {
-    int partner_socket = -1;
+    /*
+  int partner_socket = -1;
 
-    try
-    {
-        int min_peer_id = std::min((int)peer_id, partner_id);
-        int max_peer_id = std::max((int)peer_id, partner_id);
-        std::string pairing_name = comm_name + std::to_string(min_peer_id) + "_" + std::to_string(max_peer_id);
+  try
+  {
+      int min_peer_id = std::min((int)peer_id, partner_id);
+      int max_peer_id = std::max((int)peer_id, partner_id);
+      std::string pairing_name = comm_name + std::to_string(min_peer_id) + "_" + std::to_string(max_peer_id);
 
-        partner_socket = pair(pairing_name, tcpunch.hostname, tcpunch.port, tcpunch.max_timeout);
-        set_socket_options(partner_socket);
-    }
-    catch (Timeout)
-    {
-        throw Utils::Timeout();
-    }
+      partner_socket = pair(pairing_name, tcpunch.hostname, tcpunch.port, tcpunch.max_timeout);
+      set_socket_options(partner_socket);
+  }
+  catch (Timeout)
+  {
+      throw Utils::Timeout();
+  }
 
-    BOOST_LOG_TRIVIAL(info) << peer_id << ": connected via TCP with " << partner_id;
+  BOOST_LOG_TRIVIAL(info) << peer_id << ": connected via TCP with " << partner_id;
 
+  RdmaConnInfo conn_info;
+  if (peer_id < partner_id)
+  {
+      send_rdma_conn_info(partner_socket);
+      recv_rdma_conn_info(partner_socket, &conn_info);
+  }
+  else
+  {
+      recv_rdma_conn_info(partner_socket, &conn_info);
+      send_rdma_conn_info(partner_socket);
+  }
+  */
+
+    // TODO: this makes the strong assumption that all functions are on the same machine and that rdma ports can be allocated consecutively
+    // This will be changed when implementing a coordinator for gap scheduling
     RdmaConnInfo conn_info;
-    if (peer_id < partner_id)
-    {
-        send_rdma_conn_info(partner_socket);
-        recv_rdma_conn_info(partner_socket, &conn_info);
-    }
-    else
-    {
-        recv_rdma_conn_info(partner_socket, &conn_info);
-        send_rdma_conn_info(partner_socket);
-    }
+    snprintf(conn_info.ip, sizeof(conn_info.ip), "%s", local_ip.c_str());
+    conn_info.rdma_port = RDMA_LISTEN_PORT_OFFSET + partner_id;
 
     initialize_active_connection(partner_id, conn_info);
 
-    close(partner_socket);
+    // close(partner_socket);
 }
 
 void FMI::Comm::Rdma::set_socket_options(int partner_socket)
@@ -331,7 +342,7 @@ void FMI::Comm::Rdma::send_rdma_conn_info(int partner_socket)
     conn_info.rdma_port = rdma_listen_port;
 
     ssize_t sent = ::send(partner_socket, &conn_info, sizeof(RdmaConnInfo), 0);
-    if (sent == -1)
+    if (sent != sizeof(RdmaConnInfo))
     {
         if (errno == EAGAIN)
         {
