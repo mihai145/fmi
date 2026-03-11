@@ -1,18 +1,47 @@
 #include "../../include/comm/Rdma.h"
 #include <boost/log/trivial.hpp>
+#include <ifaddrs.h>
 #include <tcpunch.h>
 #include <netinet/tcp.h>
 
 constexpr int RDMA_LISTEN_PORT_OFFSET = 11005;
+constexpr int RDMA_LISTEN_PORT_RANGE = 10000;
 constexpr uint32_t RDMA_WRITE_WITH_IMMEDIATE_CT = 42;
 
-FMI::Comm::Rdma::Rdma(std::map<std::string, std::string> params) : shutdown{false}, local_ip{"192.168.2.4"}, rdma_listen_port{-1}
+FMI::Comm::Rdma::Rdma(std::map<std::string, std::string> params) : shutdown{false}, local_ip{"localhost"}, rdma_listen_port{-1}
 {
     tcpunch.hostname = params["host"];
     tcpunch.port = std::stoi(params["port"]);
     tcpunch.max_timeout = std::stoi(params["max_timeout"]);
 
-    // TODO: get local ip
+    // get local ip
+    struct ifaddrs *ifaddr, *ifa;
+    char ip[INET_ADDRSTRLEN];
+
+    if (getifaddrs(&ifaddr) == -1)
+        throw std::runtime_error("Could not get local ip");
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr)
+            continue;
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue; // IPv4 only
+
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+
+        if (sa->sin_addr.s_addr != htonl(INADDR_LOOPBACK))
+            break;
+    }
+
+    freeifaddrs(ifaddr);
+
+    local_ip = std::string(ip);
+    if (local_ip == "localhost")
+        throw std::runtime_error("Could not get local ip, got localhost");
+    else
+        BOOST_LOG_TRIVIAL(info) << "Local ip is " << local_ip;
 }
 
 FMI::Comm::Rdma::~Rdma()
@@ -166,8 +195,8 @@ void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
 
 void FMI::Comm::Rdma::initialize_rdma_server()
 {
-    rdma_listen_port = RDMA_LISTEN_PORT_OFFSET + peer_id; // TODO: random offset port based on hash of communicator name
-    int recv_buf_size = 2;                                // RTS + WriteWithImmediate
+    rdma_listen_port = RDMA_LISTEN_PORT_OFFSET + std::hash<std::string>{}(comm_name) % RDMA_LISTEN_PORT_RANGE + peer_id; // random offset port based on hash of communicator name
+    int recv_buf_size = 2;                                                                                               // RTS + WriteWithImmediate
 
     listener = std::make_unique<rdmalib::RDMAPassive>(local_ip, rdma_listen_port, recv_buf_size, true);
     listener_thread = std::thread(&Rdma::listen_rdma, this);
