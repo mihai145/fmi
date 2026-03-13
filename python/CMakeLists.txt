@@ -2,7 +2,15 @@ cmake_minimum_required(VERSION 3.10)
 project(fmi)
 set(CMAKE_CXX_STANDARD 17)
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." libfmi)
+# fmi is shared library
+add_compile_definitions(BOOST_LOG_DYN_LINK)
+
+if(FMI_TARGET_ALREADY_DEFINED)
+    message(STATUS "FMI target has already been defined")
+else()
+    message(STATUS "Adding FMI subdirectory")
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." libfmi)
+endif()
 
 find_package(Boost COMPONENTS system python3 REQUIRED)
 find_package(Python3 COMPONENTS Interpreter Development)
