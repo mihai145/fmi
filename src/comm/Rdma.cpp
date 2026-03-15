@@ -9,12 +9,19 @@ constexpr int RDMA_LISTEN_PORT_RANGE = 10000;
 constexpr int RDMA_CONNECT_RETRIES = 5;
 constexpr std::chrono::milliseconds RDMA_CONNECT_BACKOFF = std::chrono::milliseconds(10);
 constexpr uint32_t RDMA_WRITE_WITH_IMMEDIATE_CT = 42;
+constexpr size_t RDMA_PREALLOCATED_SIZE = 1024 * 1024;
 
 FMI::Comm::Rdma::Rdma(std::map<std::string, std::string> params) : shutdown{false}, local_ip{"localhost"}, rdma_listen_port{-1}
 {
     tcpunch.hostname = params["host"];
     tcpunch.port = std::stoi(params["port"]);
     tcpunch.max_timeout = std::stoi(params["max_timeout"]);
+
+    if (params["preallocate_buffers"] == "true")
+        use_preallocated_buffers = true;
+    else
+        use_preallocated_buffers = false;
+    BOOST_LOG_TRIVIAL(info) << "Preallocate buffers: " << params["preallocate_buffers"];
 
     // get local ip
     struct ifaddrs *ifaddr, *ifa;
@@ -56,15 +63,11 @@ FMI::Comm::Rdma::~Rdma()
 void FMI::Comm::Rdma::send_object(channel_data buf, Utils::peer_num rcpt_id)
 {
     /*
-     * 1) Check connection
-     * 2) Post recv for raddr, rkey (on active conn)
-     * 3) Send len (on active conn)
-     * 4) Poll for send completion
-     * 5) Poll for recv completion
-     * 6) Register mem buffer for RDMA write
-     * 7) RDMA write with immediate
-     * 8) Poll for completion
-     * 9) Deregister mem buffer
+     1) Check connection
+     2) Poll recv for rbuf_info (on active conn)
+     3) Post recv for rbuf_info (for next send)
+     4) Write with immediate
+     5) Poll for completion
      */
 
     check_connection(rcpt_id);
@@ -72,65 +75,59 @@ void FMI::Comm::Rdma::send_object(channel_data buf, Utils::peer_num rcpt_id)
     ActiveConnection &active_conn = active_connections.at(rcpt_id);
     rdmalib::Connection &conn = active_conn.active.connection();
 
-    // post recv for buffer information
+    // Poll recv for rbuf_info
+    auto [wc_recv, ret_recv] = conn.poll_wc(rdmalib::QueueType::RECV, true, 1);
+    if (ret_recv != 1 || wc_recv->status != IBV_WC_SUCCESS)
+    {
+        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed to poll for recv rbuf_info completion " << ibv_wc_status_str(wc_recv->status);
+        throw std::runtime_error("Failed poll for recv");
+    }
+
+    rdmalib::RemoteBuffer rbuf = active_conn.rbuf_info[0];
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": received rbuf info from " << rcpt_id << ": raddr=" << rbuf.addr << " rkey=" << rbuf.rkey << " size=" << rbuf.size;
+
+    // Post recv for rbuf_info
     active_conn.post_recv_rbuf_info();
 
-    // send length
-    active_conn.len_buffer[0] = buf.len;
-    conn.post_send(active_conn.len_buffer);
-
-    // poll for send completion
-    auto [wc_send, ret_send] = conn.poll_wc(rdmalib::QueueType::SEND, true, 1);
-    if (wc_send->status == IBV_WC_SUCCESS)
+    // Write with immediate
+    std::unique_ptr<rdmalib::Buffer<char>> send_buf = nullptr;
+    if (use_preallocated_buffers)
     {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": sent length to " << rcpt_id;
+        memcpy(active_conn.preallocated.data(), buf.buf, buf.len);
+
+        rdmalib::ScatterGatherElement sge;
+        sge.add(active_conn.preallocated, buf.len, 0);
+
+        conn.post_write(std::move(sge), rbuf, RDMA_WRITE_WITH_IMMEDIATE_CT);
     }
     else
     {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": error sending length to " << rcpt_id << " " << ibv_wc_status_str(wc_send->status);
+        send_buf = std::make_unique<rdmalib::Buffer<char>>(buf.buf, buf.len);
+        send_buf->register_memory(active_conn.active.pd(), IBV_ACCESS_LOCAL_WRITE);
+
+        conn.post_write(*send_buf, rbuf, RDMA_WRITE_WITH_IMMEDIATE_CT);
     }
 
-    // poll for recv completion
-    auto [wc_recv, ret_recv] = conn.poll_wc(rdmalib::QueueType::RECV, true, 1);
-    auto [raddr, rkey, rsize] = active_conn.rbuf_info_buffer.data()[0];
-    if (wc_recv->status == IBV_WC_SUCCESS)
-    {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": received from " << rcpt_id << " raddr " << raddr << " rkey " << rkey;
-    }
-    else
-    {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": error receiving rbuf_info from " << rcpt_id << " " << ibv_wc_status_str(wc_recv->status);
-    }
-
-    // register mem buffer for RDMA write
-    rdmalib::Buffer<char> rdma_buf(buf.buf, buf.len);
-    rdma_buf.register_memory(active_conn.active.pd(), IBV_ACCESS_LOCAL_WRITE);
-
-    // RDMA write with immediate
-    conn.post_write(rdma_buf, rdmalib::RemoteBuffer{raddr, rkey, (uint32_t)buf.len}, RDMA_WRITE_WITH_IMMEDIATE_CT);
-
-    // Poll for write completion
+    // Poll for completion
     auto [wc_wimm, ret_wimm] = conn.poll_wc(rdmalib::QueueType::SEND, true, 1);
-    if (wc_wimm->status == IBV_WC_SUCCESS)
+    if (ret_wimm != 1 || wc_wimm->status != IBV_WC_SUCCESS)
     {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": wrote-with-immediate to " << rcpt_id;
+        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed polling for wc_wimm " << ibv_wc_status_str(wc_wimm->status);
+        throw std::runtime_error("Failed polling for wc_wimm");
     }
-    else
-    {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": error writing-with-immediate to " << rcpt_id << " " << ibv_wc_status_str(wc_wimm->status);
-    }
+
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": sent data to " << rcpt_id;
+    if (send_buf != nullptr)
+        send_buf.reset();
 }
 
 void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
 {
     /*
-     * 1) Check connection
-     * ...2) Already posted RTS recv
-     * 2) Poll for recv completion (on passive conn)
-     * 3) Post 2 recvs (write with immediate + next RTS send_object)
-     * 4) Register buffer memory, reply with rbuf_info
-     * 5) Poll recv completion
-     * 6) Deregister mem buffer (in Buffer destructor)
+     1) Check connection
+     2) Post recv for write with immediate
+     3) Send rbuf_info
+     4) Poll for send and recv completions
      */
 
     check_connection(sender_id);
@@ -139,62 +136,69 @@ void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
     PassiveConnection &passive_conn = passive_connections.at(sender_id);
     passive_map_mutex.unlock();
 
-    // wait for RTS
-    auto [wc_rts, ret_rts] = passive_conn.conn.get()->poll_wc(rdmalib::QueueType::RECV, true, 1);
-    if (wc_rts->status == IBV_WC_SUCCESS)
+    rdmalib::Connection *conn = passive_conn.conn.get();
+
+    // Post recv for write with immediate
+    std::unique_ptr<rdmalib::Buffer<char>> recv_buf = nullptr;
+    if (use_preallocated_buffers)
     {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": received length " << passive_conn.rts_buffer[0] << " from " << sender_id;
+        rdmalib::ScatterGatherElement sge;
+        sge.add(passive_conn.preallocated, buf.len, 0);
+        conn->post_recv(std::move(sge));
+
+        passive_conn.rbuf_info[0] = {
+            passive_conn.preallocated.address(),
+            passive_conn.preallocated.rkey(),
+            (uint32_t)buf.len};
     }
     else
     {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": error receiving length from " << sender_id << " " << ibv_wc_status_str(wc_rts->status);
+        recv_buf = std::make_unique<rdmalib::Buffer<char>>(buf.buf, buf.len);
+        recv_buf->register_memory(passive_conn.pd, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        conn->post_recv(*recv_buf);
+
+        passive_conn.rbuf_info[0] = {
+            recv_buf->address(),
+            recv_buf->rkey(),
+            (uint32_t)buf.len};
     }
 
-    uint32_t rcvd_len = passive_conn.rts_buffer[0];
-    if (rcvd_len != buf.len)
+    // Send rbuf_info
+    conn->post_send(passive_conn.rbuf_info);
+
+    // Poll for send and recv completions
+    auto [wc_send, ret_send] = conn->poll_wc(rdmalib::QueueType::SEND, true, 1);
+    if (ret_send != 1 || wc_send->status != IBV_WC_SUCCESS)
     {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": buffer lengths do not match - expected " << buf.len << " got " << rcvd_len;
+        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed polling for wc_send " << ibv_wc_status_str(wc_send->status);
+        throw std::runtime_error("Failed polling for wc_send");
     }
 
-    // post receives for Write-with-immediate and next RTS
-    passive_conn.post_recv_wimm();
-    passive_conn.post_recv_rts();
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": sent rbuf info to " << sender_id
+                            << ": raddr=" << passive_conn.rbuf_info[0].addr
+                            << " rkey=" << passive_conn.rbuf_info[0].rkey
+                            << " size=" << passive_conn.rbuf_info[0].size;
 
-    // register buffer
-    rdmalib::Buffer<char> rdma_buffer(buf.buf, buf.len);
-    rdma_buffer.register_memory(passive_conn.pd, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-
-    // send buffer information
-    rdmalib::RemoteBuffer buf_info(rdma_buffer.address(), rdma_buffer.rkey(), rdma_buffer.size());
-    passive_conn.buf_info_buffer[0] = buf_info;
-    passive_conn.conn.get()->post_send(passive_conn.buf_info_buffer);
-
-    auto [wc_send, ret_send] = passive_conn.conn.get()->poll_wc(rdmalib::QueueType::SEND, true, 1);
-    if (wc_send->status == IBV_WC_SUCCESS)
+    auto [wc_wimm, ret_wimm] = conn->poll_wc(rdmalib::QueueType::RECV, true, 1);
+    if (ret_wimm != 1 || wc_wimm->status != IBV_WC_SUCCESS)
     {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": sent buffer info to " << sender_id << " raddr " << buf_info.addr << " rkey " << buf_info.rkey;
-    }
-    else
-    {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed to send buffer info to " << sender_id << " " << ibv_wc_status_str(wc_send->status);
-    }
-
-    // wait for Write-with-immediate
-    auto [wc_wimm, ret_wimm] = passive_conn.conn.get()->poll_wc(rdmalib::QueueType::RECV, true, 1);
-    if (wc_wimm->status == IBV_WC_SUCCESS)
-    {
-        BOOST_LOG_TRIVIAL(info) << peer_id << ": successfully received write-with-immediate from " << sender_id;
-    }
-    else
-    {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed to receive write-with-immediate from " << sender_id << " " << ibv_wc_status_str(wc_wimm->status);
+        BOOST_LOG_TRIVIAL(error) << peer_id << ": failed polling for wc_wimm " << ibv_wc_status_str(wc_wimm->status);
+        throw std::runtime_error("Failed polling for wc_wimm");
     }
 
     uint32_t imm_data = ntohl(wc_wimm->imm_data);
     if (imm_data != RDMA_WRITE_WITH_IMMEDIATE_CT)
     {
-        BOOST_LOG_TRIVIAL(error) << peer_id << ": immediate does not match for sender " << sender_id << " - expected " << RDMA_WRITE_WITH_IMMEDIATE_CT << " got " << imm_data;
+        BOOST_LOG_TRIVIAL(error) << peer_id << ": immediate does not match, expected " << RDMA_WRITE_WITH_IMMEDIATE_CT << " got " << imm_data;
+        throw std::runtime_error("Immediate does not match");
     }
+
+    if (use_preallocated_buffers)
+        memcpy(buf.buf, passive_conn.preallocated.data(), buf.len);
+    else
+        recv_buf.reset();
+
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": received data from " << sender_id;
 }
 
 void FMI::Comm::Rdma::initialize_rdma_server()
@@ -250,8 +254,7 @@ void FMI::Comm::Rdma::listen_rdma()
 void FMI::Comm::Rdma::insert_passive_connection(int partner_id, rdmalib::Connection *conn)
 {
     std::lock_guard<std::mutex> lock(passive_map_mutex);
-    passive_connections.emplace(std::piecewise_construct, std::forward_as_tuple(partner_id), std::forward_as_tuple(listener->pd(), conn));
-    passive_connections.at(partner_id).post_recv_rts();
+    passive_connections.emplace(std::piecewise_construct, std::forward_as_tuple(partner_id), std::forward_as_tuple(listener->pd(), conn, use_preallocated_buffers));
     passive_map_cv.notify_one();
 }
 
@@ -378,7 +381,7 @@ void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo 
 
     for (int i = 0; i < RDMA_CONNECT_RETRIES; i++)
     {
-        ActiveConnection conn(conn_info.ip, conn_info.rdma_port);
+        ActiveConnection conn(conn_info.ip, conn_info.rdma_port, use_preallocated_buffers);
 
         if (conn.active.connect(peer_id))
         {
@@ -395,36 +398,31 @@ void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo 
     throw std::runtime_error("could not connect to partner");
 }
 
-FMI::Comm::PassiveConnection::PassiveConnection(ibv_pd *pd, rdmalib::Connection *conn) : pd{pd}, conn{conn}, rts_buffer{1}, wimm_buffer{1}, buf_info_buffer{1}
+FMI::Comm::PassiveConnection::PassiveConnection(ibv_pd *pd, rdmalib::Connection *conn, bool preallocate) : pd{pd}, conn{conn}, rbuf_info{1}, preallocated{preallocate ? RDMA_PREALLOCATED_SIZE : 0}
 {
-    rts_buffer.register_memory(pd, IBV_ACCESS_LOCAL_WRITE);
-    wimm_buffer.register_memory(pd, IBV_ACCESS_LOCAL_WRITE);
-    buf_info_buffer.register_memory(pd, IBV_ACCESS_LOCAL_WRITE);
+    rbuf_info.register_memory(pd, IBV_ACCESS_LOCAL_WRITE);
+
+    if (preallocate)
+        preallocated.register_memory(pd, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 }
 
-void FMI::Comm::PassiveConnection::post_recv_rts()
-{
-    conn->post_recv(rts_buffer);
-}
-
-void FMI::Comm::PassiveConnection::post_recv_wimm()
-{
-    conn->post_recv(wimm_buffer);
-}
-
-FMI::Comm::ActiveConnection::ActiveConnection(const std::string &ip, int port) : active{ip, port}, rbuf_info_buffer{1}, len_buffer{1}
+FMI::Comm::ActiveConnection::ActiveConnection(const std::string &ip, int port, bool preallocate) : active{ip, port}, rbuf_info{1}, preallocated{preallocate ? RDMA_PREALLOCATED_SIZE : 0}
 {
     active.allocate();
-    rbuf_info_buffer.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
-    len_buffer.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
+    rbuf_info.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
+
+    if (preallocate)
+        preallocated.register_memory(active.pd(), IBV_ACCESS_LOCAL_WRITE);
+
+    post_recv_rbuf_info();
 }
 
-FMI::Comm::ActiveConnection::ActiveConnection(ActiveConnection &&obj) : len_buffer{std::move(obj.len_buffer)}, rbuf_info_buffer{std::move(obj.rbuf_info_buffer)}
+FMI::Comm::ActiveConnection::ActiveConnection(ActiveConnection &&obj) : rbuf_info{std::move(obj.rbuf_info)}, preallocated{std::move(obj.preallocated)}
 {
     active = std::move(obj.active);
 }
 
 void FMI::Comm::ActiveConnection::post_recv_rbuf_info()
 {
-    active.connection().post_recv(rbuf_info_buffer);
+    active.connection().post_recv(rbuf_info);
 }

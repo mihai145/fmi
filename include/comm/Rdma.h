@@ -59,6 +59,9 @@ namespace FMI::Comm
         std::map<int, PassiveConnection> passive_connections;
         std::map<int, ActiveConnection> active_connections;
 
+        // Communication protocol
+        bool use_preallocated_buffers = false;
+
         void check_connection(int partner_id);
         void initialize_rdma_server();
         void listen_rdma();
@@ -84,23 +87,19 @@ namespace FMI::Comm
     {
         ibv_pd *pd;
         std::unique_ptr<rdmalib::Connection> conn;
-        rdmalib::Buffer<uint32_t> rts_buffer;
-        rdmalib::Buffer<uint32_t> wimm_buffer;
-        rdmalib::Buffer<rdmalib::RemoteBuffer> buf_info_buffer;
+        rdmalib::Buffer<rdmalib::RemoteBuffer> rbuf_info;
+        rdmalib::Buffer<char> preallocated;
 
-        PassiveConnection(ibv_pd *pd, rdmalib::Connection *conn);
-
-        void post_recv_rts();
-        void post_recv_wimm();
+        PassiveConnection(ibv_pd *pd, rdmalib::Connection *conn, bool preallocate);
     };
 
     struct ActiveConnection
     {
         rdmalib::RDMAActive active;
-        rdmalib::Buffer<uint32_t> len_buffer;
-        rdmalib::Buffer<rdmalib::RemoteBuffer> rbuf_info_buffer;
+        rdmalib::Buffer<rdmalib::RemoteBuffer> rbuf_info;
+        rdmalib::Buffer<char> preallocated;
 
-        ActiveConnection(const std::string &ip, int port);
+        ActiveConnection(const std::string &ip, int port, bool preallocate);
         ActiveConnection(ActiveConnection &&obj);
 
         void post_recv_rbuf_info();
