@@ -6,7 +6,7 @@
 
 constexpr int RDMA_LISTEN_PORT_OFFSET = 11005;
 constexpr int RDMA_LISTEN_PORT_RANGE = 10000;
-constexpr int RDMA_CONNECT_RETRIES = 5;
+constexpr std::chrono::seconds RDMA_CONNECT_TIMEOUT = std::chrono::seconds(5);
 constexpr std::chrono::milliseconds RDMA_CONNECT_BACKOFF = std::chrono::milliseconds(10);
 constexpr uint32_t RDMA_WRITE_WITH_IMMEDIATE_CT = 42;
 constexpr size_t RDMA_PREALLOCATED_SIZE = 10 * 1024 * 1024; // 10MB
@@ -379,7 +379,8 @@ void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo 
 {
     BOOST_LOG_TRIVIAL(info) << peer_id << ": connecting to partner " << partner_id << " at ip " << conn_info.ip << " and rdma port " << conn_info.rdma_port;
 
-    for (int i = 0; i < RDMA_CONNECT_RETRIES; i++)
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0;; i++)
     {
         ActiveConnection conn(conn_info.ip, conn_info.rdma_port, use_preallocated_buffers);
 
@@ -392,6 +393,9 @@ void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo 
 
         BOOST_LOG_TRIVIAL(warning) << peer_id << ": could not connect to partner " << partner_id << ", retrying...";
         std::this_thread::sleep_for(RDMA_CONNECT_BACKOFF);
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - start > RDMA_CONNECT_TIMEOUT) break;
     }
 
     BOOST_LOG_TRIVIAL(error) << peer_id << ": could not connect to partner " << partner_id;
