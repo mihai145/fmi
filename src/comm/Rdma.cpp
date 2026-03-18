@@ -234,7 +234,8 @@ void FMI::Comm::Rdma::listen_rdma()
         if (conn_status == rdmalib::ConnectionStatus::DISCONNECTED)
         {
             BOOST_LOG_TRIVIAL(info) << peer_id << ": partner with id " << partner_id << " disconnected";
-            remove_passive_connection(partner_id);
+            // Not needed, since the destructor of the channel will clear the map. Removing early has a race condition with recv_object.
+            // remove_passive_connection(partner_id);
         }
         else if (conn_status == rdmalib::ConnectionStatus::REQUESTED)
         {
@@ -395,7 +396,8 @@ void FMI::Comm::Rdma::initialize_active_connection(int partner_id, RdmaConnInfo 
         std::this_thread::sleep_for(RDMA_CONNECT_BACKOFF);
 
         auto now = std::chrono::steady_clock::now();
-        if (now - start > RDMA_CONNECT_TIMEOUT) break;
+        if (now - start > RDMA_CONNECT_TIMEOUT)
+            break;
     }
 
     BOOST_LOG_TRIVIAL(error) << peer_id << ": could not connect to partner " << partner_id;
