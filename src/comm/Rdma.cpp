@@ -203,7 +203,7 @@ void FMI::Comm::Rdma::recv_object(channel_data buf, Utils::peer_num sender_id)
 
 void FMI::Comm::Rdma::initialize_rdma_server()
 {
-    int recv_buf_size = 2; // RTS + WriteWithImmediate
+    int recv_buf_size = 128;
 
     // TODO: ports will be assigned by coordinator
     rdma_listen_port = RDMA_LISTEN_PORT_OFFSET + peer_id;
