@@ -2,9 +2,14 @@
 #include "../../include/comm/S3.h"
 #include "../../include/comm/Redis.h"
 #include "../../include/comm/Direct.h"
+#include "../../include/comm/DirectNoHolepunch.h"
 
 #if FMI_RDMA
 #include "../../include/comm/Rdma.h"
+#endif
+
+#if LINK_WITH_CHECKPOINTING_LIB
+#include "../../include/comm/DirectNoHolepunch.h"
 #endif
 
 std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name, std::map<std::string, std::string> params,
@@ -19,6 +24,11 @@ std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string 
     #if FMI_RDMA
     else if (name == "Rdma") {
         return std::make_shared<Rdma>(params);
+    }
+    #endif
+    #if LINK_WITH_CHECKPOINTING_LIB
+    else if (name == "DirectNoHolepunch") {
+        return std::make_shared<DirectNoHolepunch>(params, model_params);
     }
     #endif
     else {

@@ -6,6 +6,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(FMI_BUILD_SHARED "Build FMI as a shared library" OFF)
 option(FMI_RDMA "Enable RDMA support in FMI" OFF)
+option(LINK_WITH_CHECKPOINTING_LIB "Link with the pre-built checkpointing library" OFF)
 
 if(FMI_BUILD_SHARED)
     add_compile_definitions(BOOST_LOG_DYN_LINK)
@@ -61,6 +62,34 @@ if(FMI_RDMA)
     target_compile_definitions(FMI PRIVATE FMI_RDMA=1)
     target_include_directories(FMI PRIVATE ${RDMALIB_INCLUDE_PATH})
     target_link_libraries(FMI rdmalib cereal)
+endif()
+
+if(LINK_WITH_CHECKPOINTING_LIB)
+    list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
+
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(GAP_RUNNER_SOURCE_DIR "${REPO_ROOT}/src")
+    set(GAP_RUNNER_BUILD_DIR  "${REPO_ROOT}/build/scheduler")
+
+    set(CHECKPOINT_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint.so")
+
+    if(NOT EXISTS "${CHECKPOINT_LIB_PATH}")
+        message(FATAL_ERROR "Missing ${CHECKPOINT_LIB_PATH}. Build scheduler first.")
+    else()
+        message(STATUS "Found libcheckpoint.")
+    endif()
+
+    add_library(libcheckpoint SHARED IMPORTED GLOBAL)
+    set_target_properties(libcheckpoint PROPERTIES
+        IMPORTED_LOCATION "${CHECKPOINT_LIB_PATH}"
+    )
+    target_include_directories(libcheckpoint INTERFACE
+        "${GAP_RUNNER_SOURCE_DIR}/common"
+    )
+
+    target_compile_definitions(FMI PRIVATE LINK_WITH_CHECKPOINTING_LIB=1)
+    target_link_libraries(FMI libcheckpoint)
+    target_include_directories(FMI PRIVATE "${GAP_RUNNER_SOURCE_DIR}/lib")
 endif()
 
 #find_package(OpenMP REQUIRED)
