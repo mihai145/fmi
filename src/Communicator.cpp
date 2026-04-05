@@ -43,4 +43,9 @@ namespace FMI {
         policy->set_hint(hint);
     }
 
+    void Communicator::check_for_checkpoint() {
+        auto chan = channels.find("DirectNoHolepunch");
+        if (chan == channels.end()) throw std::runtime_error("Not implemented");
+        else chan->second->check_for_checkpoint();
+    }
 }

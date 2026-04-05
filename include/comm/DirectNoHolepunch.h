@@ -9,7 +9,7 @@
 namespace FMI::Comm
 {
     const auto TCP_CONNECT_BACKOFF = std::chrono::milliseconds(100);
-    
+
     class DirectNoHolepunch : public PeerToPeer
     {
     public:
@@ -19,6 +19,8 @@ namespace FMI::Comm
         void send_object(channel_data buf, Utils::peer_num rcpt_id) override;
 
         void recv_object(channel_data buf, Utils::peer_num sender_id) override;
+
+        void check_for_checkpoint() override;
 
         double get_latency(Utils::peer_num producer, Utils::peer_num consumer, std::size_t size_in_bytes) override
         {

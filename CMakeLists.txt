@@ -46,6 +46,13 @@ else()
     message(STATUS "Building FMI without RDMA")
 endif()
 
+if(LINK_WITH_CHECKPOINTING_LIB)
+    list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
+    message(STATUS "Building FMI with checkpointing lib")
+else()
+    message(STATUS "Building FMI without checkpointing lib")
+endif()
+
 if(FMI_BUILD_SHARED)
     add_library(FMI SHARED ${FMI_SOURCES})
     message(STATUS "Building FMI as shared lib")
@@ -65,8 +72,6 @@ if(FMI_RDMA)
 endif()
 
 if(LINK_WITH_CHECKPOINTING_LIB)
-    list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
-
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(GAP_RUNNER_SOURCE_DIR "${REPO_ROOT}/src")
     set(GAP_RUNNER_BUILD_DIR  "${REPO_ROOT}/build/scheduler")

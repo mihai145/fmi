@@ -21,6 +21,8 @@ void FMI::Comm::DirectNoHolepunch::send_object(channel_data buf, Utils::peer_num
     // blocking send all bytes to given peer
     check_socket(rcpt_id);
 
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": send object to " << rcpt_id;
+
     std::size_t total_sent = 0;
     while (total_sent < buf.len)
     {
@@ -40,6 +42,8 @@ void FMI::Comm::DirectNoHolepunch::recv_object(channel_data buf, Utils::peer_num
 {
     // blocking recv all bytes from given peer
     check_socket(sender_id);
+
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": recv object from " << sender_id;
 
     std::size_t total_received = 0;
     while (total_received < buf.len)
@@ -80,7 +84,16 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
         {
             sockets[partner_id] = ::socket(AF_INET, SOCK_STREAM, 0);
             if (::connect(sockets[partner_id], (struct sockaddr *)&dest, sizeof(dest)) == 0)
+            {
+                // send peer id so that partner can identify us
+                if (::send(sockets[partner_id], &peer_id, sizeof(peer_id), 0) != sizeof(peer_id))
+                {
+                    BOOST_LOG_TRIVIAL(error) << peer_id << ": Could not send identification message to partner " << partner_id;
+                    throw std::runtime_error("Could not send identification message to partner");
+                }
+
                 break;
+            }
             BOOST_LOG_TRIVIAL(debug) << peer_id << ": Connect to peer " << partner_id << " failed, retrying...";
             ::close(sockets[partner_id]);
             std::this_thread::sleep_for(TCP_CONNECT_BACKOFF);
@@ -90,12 +103,24 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
     {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
-        sockets[partner_id] = ::accept(listen_sock, (struct sockaddr *)&src, &src_len);
-        if (sockets[partner_id] < 0)
+        int new_socket = ::accept(listen_sock, (struct sockaddr *)&src, &src_len);
+        if (new_socket < 0)
         {
             BOOST_LOG_TRIVIAL(error) << peer_id << ": Accept failed: " << strerror(errno);
             throw std::runtime_error("Accept failed");
         }
+
+        // identify newly connected peer
+        Utils::peer_num newly_connected_id;
+        if (::recv(new_socket, &newly_connected_id, sizeof(newly_connected_id), MSG_WAITALL) != sizeof(newly_connected_id))
+        {
+            BOOST_LOG_TRIVIAL(error) << peer_id << ": Could not receive identification message from partner " << partner_id;
+            throw std::runtime_error("Could not receive identification message from partner");
+        }
+
+        sockets[newly_connected_id] = new_socket;
+        if (newly_connected_id != partner_id) // accept the connection we actually want
+            check_socket(partner_id);
     }
 
     int one = 1;
@@ -140,6 +165,15 @@ void FMI::Comm::DirectNoHolepunch::initialize_state()
         BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to listen to bound address: " << get_error_message(result);
         throw std::runtime_error("Failed to listen: " + std::string(strerror(errno)));
     }
+
+    BOOST_LOG_TRIVIAL(info) << own_id << ": Listening on port " << peers[own_id].port;
+}
+
+void FMI::Comm::DirectNoHolepunch::check_for_checkpoint()
+{
+    checkpointer.check_should_checkpoint([&]()
+                                         { teardown_state(); }, [&]()
+                                         { initialize_state(); });
 }
 
 void FMI::Comm::DirectNoHolepunch::teardown_state()
