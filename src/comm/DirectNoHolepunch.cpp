@@ -75,6 +75,8 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
 
     if (peer_id < partner_id)
     {
+        BOOST_LOG_TRIVIAL(info) << peer_id << ": Trying connect() to " << partner_id;
+
         struct sockaddr_in dest{};
         dest.sin_family = AF_INET;
         dest.sin_port = htons(peers[partner_id].port);
@@ -101,6 +103,8 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
     }
     else
     {
+        BOOST_LOG_TRIVIAL(info) << peer_id << ": Trying accept() from " << partner_id;
+
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         int new_socket = ::accept(listen_sock, (struct sockaddr *)&src, &src_len);
@@ -133,6 +137,7 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
 void FMI::Comm::DirectNoHolepunch::initialize_state()
 {
     int own_id = checkpointer.get_own_id();
+    BOOST_LOG_TRIVIAL(info) << own_id << ": intializing state, getting peer details...";
 
     auto result = checkpointer.get_peer_details();
     if (std::holds_alternative<Error>(result))
@@ -142,6 +147,7 @@ void FMI::Comm::DirectNoHolepunch::initialize_state()
     }
 
     peers = std::get<std::vector<checkpoint::peer_details>>(result);
+    BOOST_LOG_TRIVIAL(info) << own_id << ": initializing state, got " << peers.size() << " peers";
 
     // open TCP server socket
     listen_sock = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -178,6 +184,8 @@ void FMI::Comm::DirectNoHolepunch::check_for_checkpoint()
 
 void FMI::Comm::DirectNoHolepunch::teardown_state()
 {
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": closing connections to peers and listening socket...";
+
     for (auto &s : sockets)
         if (s >= 0)
         {
@@ -190,4 +198,6 @@ void FMI::Comm::DirectNoHolepunch::teardown_state()
         ::close(listen_sock);
         listen_sock = -1;
     }
+
+    BOOST_LOG_TRIVIAL(info) << peer_id << ": tearing down state complete";
 }
