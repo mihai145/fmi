@@ -158,9 +158,6 @@ namespace FMI {
         //! Set the hint (optimization objective) of the channel selection procedure.
         void hint(FMI::Utils::Hint hint);
 
-        //! Allow the application to be checkpointed during this call
-        void check_for_checkpoint();
-
     private:
         std::shared_ptr<FMI::Utils::ChannelPolicy> policy;
         std::map<std::string, std::shared_ptr<FMI::Comm::Channel>> channels;

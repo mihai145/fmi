@@ -47,6 +47,7 @@ else()
 endif()
 
 if(LINK_WITH_CHECKPOINTING_LIB)
+    list(APPEND FMI_SOURCES src/comm/CheckpointablePeerToPeer.cpp)
     list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
     message(STATUS "Building FMI with checkpointing lib")
 else()

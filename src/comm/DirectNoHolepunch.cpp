@@ -8,12 +8,12 @@
 FMI::Comm::DirectNoHolepunch::DirectNoHolepunch(std::map<std::string, std::string> params, std::map<std::string, std::string> model_params)
 {
     listen_sock = -1;
-    initialize_state();
+    restore_fn();
 }
 
 FMI::Comm::DirectNoHolepunch::~DirectNoHolepunch()
 {
-    teardown_state();
+    teardown_fn();
 }
 
 void FMI::Comm::DirectNoHolepunch::send_object(channel_data buf, Utils::peer_num rcpt_id)
@@ -134,7 +134,7 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
     setsockopt(sockets[partner_id], SOL_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
-void FMI::Comm::DirectNoHolepunch::initialize_state()
+void FMI::Comm::DirectNoHolepunch::restore_fn()
 {
     int own_id = checkpointer.get_own_id();
     BOOST_LOG_TRIVIAL(info) << own_id << ": intializing state, getting peer details...";
@@ -175,14 +175,7 @@ void FMI::Comm::DirectNoHolepunch::initialize_state()
     BOOST_LOG_TRIVIAL(info) << own_id << ": Listening on port " << peers[own_id].port;
 }
 
-void FMI::Comm::DirectNoHolepunch::check_for_checkpoint()
-{
-    checkpointer.check_should_checkpoint([&]()
-                                         { teardown_state(); }, [&]()
-                                         { initialize_state(); });
-}
-
-void FMI::Comm::DirectNoHolepunch::teardown_state()
+void FMI::Comm::DirectNoHolepunch::teardown_fn()
 {
     BOOST_LOG_TRIVIAL(info) << peer_id << ": closing connections to peers and listening socket...";
 

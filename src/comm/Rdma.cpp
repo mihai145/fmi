@@ -6,7 +6,7 @@
 
 constexpr int RDMA_LISTEN_PORT_OFFSET = 11005;
 constexpr int RDMA_LISTEN_PORT_RANGE = 10000;
-constexpr std::chrono::seconds RDMA_CONNECT_TIMEOUT = std::chrono::seconds(5);
+constexpr std::chrono::seconds RDMA_CONNECT_TIMEOUT = std::chrono::seconds(30);
 constexpr std::chrono::milliseconds RDMA_CONNECT_BACKOFF = std::chrono::milliseconds(10);
 constexpr uint32_t RDMA_WRITE_WITH_IMMEDIATE_CT = 42;
 constexpr size_t RDMA_PREALLOCATED_SIZE = 10 * 1024 * 1024; // 10MB

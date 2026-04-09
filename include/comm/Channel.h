@@ -89,10 +89,6 @@ namespace FMI::Comm {
         //! Inclusive prefix scan, recvbuf / sendbuf needs to be set for all peers
         virtual void scan(channel_data sendbuf, channel_data recvbuf, raw_function f) = 0;
 
-        virtual void check_for_checkpoint() {
-            throw std::runtime_error("Not implemented");
-        }
-
         //! Helper utility to set peer id, ID needs to be set before first collective operation
         void set_peer_id(FMI::Utils::peer_num num) { peer_id = num; }
 
