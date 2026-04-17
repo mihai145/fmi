@@ -5,6 +5,13 @@
 #include <boost/log/trivial.hpp>
 #include <thread>
 
+namespace
+{
+    constexpr int FMI_PORT_OFFSET = 20000;
+    constexpr int FMI_PORT_RANGE = 20000;
+    std::chrono::milliseconds GET_PEER_DETAILS_BACKOFF(1);
+}
+
 FMI::Comm::DirectNoHolepunch::DirectNoHolepunch(std::map<std::string, std::string> params, std::map<std::string, std::string> model_params)
 {
     listen_sock = -1;
@@ -73,6 +80,23 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
     if (sockets[partner_id] != -1)
         return;
 
+    while (peers[partner_id].port == -1)
+    {
+        BOOST_LOG_TRIVIAL(info) << peer_id << ": Unknown address for partner " << partner_id << ", getting peer details...";
+
+        auto result = checkpointer.get_peer_details();
+        if (std::holds_alternative<Error>(result))
+        {
+            BOOST_LOG_TRIVIAL(error) << peer_id << ": Failed to get peer details: " << get_error_message(result);
+            throw std::runtime_error("Failed to get peer details");
+        }
+
+        peers = std::get<std::vector<checkpoint::peer_details>>(result);
+
+        if (peers[partner_id].port == -1)
+            std::this_thread::sleep_for(GET_PEER_DETAILS_BACKOFF);
+    }
+
     if (peer_id < partner_id)
     {
         BOOST_LOG_TRIVIAL(info) << peer_id << ": Trying connect() to " << partner_id;
@@ -136,8 +160,54 @@ void FMI::Comm::DirectNoHolepunch::check_socket(Utils::peer_num partner_id)
 
 void FMI::Comm::DirectNoHolepunch::restore_fn()
 {
+    srand(time(nullptr));
+
     int own_id = checkpointer.get_own_id();
-    BOOST_LOG_TRIVIAL(info) << own_id << ": intializing state, getting peer details...";
+    BOOST_LOG_TRIVIAL(info) << own_id << ": intializing state, finding a port to listen to..";
+
+    int port = -1;
+    while (true)
+    {
+        // open TCP server socket
+        listen_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1;
+        setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        port = FMI_PORT_OFFSET + rand() % FMI_PORT_RANGE;
+        BOOST_LOG_TRIVIAL(info) << own_id << ": trying to bind to port " << port;
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (::bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        {
+            ::close(listen_sock);
+            BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to bind port " << port << ", retrying..";
+            continue;
+        }
+        else
+            BOOST_LOG_TRIVIAL(info) << own_id << ": bound to port " << port;
+
+        if (::listen(listen_sock, num_peers) < 0)
+        {
+            ::close(listen_sock);
+            BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to listen to bound address, retrying...";
+            continue;
+        }
+        else
+            break;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << own_id << ": Listening on port " << port;
+
+    auto res_register = checkpointer.register_peer_details(port);
+    if (std::holds_alternative<Error>(res_register))
+    {
+        BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to register peer details: " << get_error_message(res_register);
+        throw std::runtime_error("Failed to register peer details");
+    }
 
     auto result = checkpointer.get_peer_details();
     if (std::holds_alternative<Error>(result))
@@ -149,30 +219,7 @@ void FMI::Comm::DirectNoHolepunch::restore_fn()
     peers = std::get<std::vector<checkpoint::peer_details>>(result);
     BOOST_LOG_TRIVIAL(info) << own_id << ": initializing state, got " << peers.size() << " peers";
 
-    // open TCP server socket
-    listen_sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    int one = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(peers[own_id].port);
-
-    if (::bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        ::close(listen_sock);
-        BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to bind address: " << get_error_message(result);
-        throw std::runtime_error("Failed to bind: " + std::string(strerror(errno)));
-    }
-    if (::listen(listen_sock, num_peers) < 0)
-    {
-        ::close(listen_sock);
-        BOOST_LOG_TRIVIAL(error) << own_id << ": Failed to listen to bound address: " << get_error_message(result);
-        throw std::runtime_error("Failed to listen: " + std::string(strerror(errno)));
-    }
-
-    BOOST_LOG_TRIVIAL(info) << own_id << ": Listening on port " << peers[own_id].port;
+    BOOST_LOG_TRIVIAL(info) << own_id << ": restored state";
 }
 
 void FMI::Comm::DirectNoHolepunch::teardown_fn()
