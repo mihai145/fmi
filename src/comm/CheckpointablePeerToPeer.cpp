@@ -1,5 +1,5 @@
 #include "../../include/comm/CheckpointablePeerToPeer.h"
-#include "checkpoint.hpp"
+#include "checkpoint_v1.hpp"
 
 void FMI::Comm::CheckpointablePeerToPeer::bcast(channel_data buf, FMI::Utils::peer_num root)
 {

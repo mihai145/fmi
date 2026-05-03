@@ -2,7 +2,7 @@
 #define FMI_CHECKPOINTABLE_PEERTOPEER_H
 
 #include "PeerToPeer.h"
-#include "checkpoint.hpp"
+#include "checkpoint_v1.hpp"
 
 namespace FMI::Comm
 {

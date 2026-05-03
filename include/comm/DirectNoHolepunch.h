@@ -2,7 +2,7 @@
 #define FMI_DIRECT_NO_HOLEPUNCH_H
 
 #include "CheckpointablePeerToPeer.h"
-#include "checkpoint.hpp"
+#include "checkpoint_v1.hpp"
 
 #include <chrono>
 
