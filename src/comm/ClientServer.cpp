@@ -65,9 +65,7 @@ void FMI::Comm::ClientServer::barrier() {
 }
 
 void FMI::Comm::ClientServer::finalize() {
-    for (const auto& object_name : created_objects) {
-        delete_object(object_name);
-    }
+    created_objects.clear();
 }
 
 void FMI::Comm::ClientServer::download(channel_data buf, std::string name) {
