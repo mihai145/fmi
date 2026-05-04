@@ -49,7 +49,7 @@ void FMI::Comm::ClientServer::barrier() {
     char b = '1';
     upload({&b, sizeof(b)}, file_name);
     unsigned int elapsed_time = 0;
-    while (elapsed_time < max_timeout) {
+    while (max_timeout == 0 || elapsed_time < max_timeout) {
         auto objects = get_object_names();
         auto has_barrier_suffix = [barrier_suffix] (const std::string& s){return s.size() > barrier_suffix.size() &&
                                                     s.compare(s.size() - barrier_suffix.size(), barrier_suffix.size(), barrier_suffix) == 0 ;};
@@ -70,7 +70,7 @@ void FMI::Comm::ClientServer::finalize() {
 
 void FMI::Comm::ClientServer::download(channel_data buf, std::string name) {
     unsigned int elapsed_time = 0;
-    while (elapsed_time < max_timeout) {
+    while (max_timeout == 0 || elapsed_time < max_timeout) {
         bool success = download_object(buf, name);
         if (success) {
             return;
@@ -98,7 +98,7 @@ void FMI::Comm::ClientServer::reduce(channel_data sendbuf, channel_data recvbuf,
         received[root] = true;
         applied[root] = true;
         unsigned int elapsed_time = 0;
-        while (elapsed_time < max_timeout && std::any_of(applied.begin(), applied.end(), [] (bool v) { return !v; }) ) {
+        while ((max_timeout == 0 || elapsed_time < max_timeout) && std::any_of(applied.begin(), applied.end(), [] (bool v) { return !v; }) ) {
             // Receive all values
             for (int i = 0; i < num_peers; i++) {
                 if (received[i]) {
@@ -149,7 +149,7 @@ void FMI::Comm::ClientServer::scan(channel_data sendbuf, channel_data recvbuf, r
     received[peer_id] = true;
     applied[peer_id] = true;
     unsigned int elapsed_time = 0;
-    while (elapsed_time < max_timeout && std::any_of(applied.begin(), applied.end(), [] (bool v) { return !v; }) ) {
+    while ((max_timeout == 0 || elapsed_time < max_timeout) && std::any_of(applied.begin(), applied.end(), [] (bool v) { return !v; }) ) {
         // Receive all values
         for (int i = 0; i < num_data; i++) {
             if (received[i]) {

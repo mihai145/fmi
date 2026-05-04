@@ -49,6 +49,7 @@ endif()
 if(LINK_WITH_CHECKPOINTING_LIB)
     list(APPEND FMI_SOURCES src/comm/CheckpointablePeerToPeer.cpp)
     list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
+    list(APPEND FMI_SOURCES src/comm/RedisCheckpoint.cpp)
     message(STATUS "Building FMI with checkpointing lib")
 else()
     message(STATUS "Building FMI without checkpointing lib")
@@ -77,24 +78,39 @@ if(LINK_WITH_CHECKPOINTING_LIB)
     set(GAP_RUNNER_SOURCE_DIR "${REPO_ROOT}/src")
     set(GAP_RUNNER_BUILD_DIR  "${REPO_ROOT}/build/scheduler")
 
-    set(CHECKPOINT_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint.so")
+    set(CHECKPOINT_V1_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint_v1.so")
+    set(CHECKPOINT_V2_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint_v2.so")
 
-    if(NOT EXISTS "${CHECKPOINT_LIB_PATH}")
-        message(FATAL_ERROR "Missing ${CHECKPOINT_LIB_PATH}. Build scheduler first.")
+    if(NOT EXISTS "${CHECKPOINT_V1_LIB_PATH}")
+        message(FATAL_ERROR "Missing ${CHECKPOINT_V1_LIB_PATH}. Build scheduler first.")
     else()
-        message(STATUS "Found libcheckpoint.")
+        message(STATUS "Found libcheckpoint_v1.")
     endif()
 
-    add_library(libcheckpoint SHARED IMPORTED GLOBAL)
-    set_target_properties(libcheckpoint PROPERTIES
-        IMPORTED_LOCATION "${CHECKPOINT_LIB_PATH}"
+    if(NOT EXISTS "${CHECKPOINT_V2_LIB_PATH}")
+        message(FATAL_ERROR "Missing ${CHECKPOINT_V2_LIB_PATH}. Build scheduler first.")
+    else()
+        message(STATUS "Found libcheckpoint_v2.")
+    endif()
+
+    add_library(libcheckpoint_v1 SHARED IMPORTED GLOBAL)
+    set_target_properties(libcheckpoint_v1 PROPERTIES
+        IMPORTED_LOCATION "${CHECKPOINT_V1_LIB_PATH}"
     )
-    target_include_directories(libcheckpoint INTERFACE
+    target_include_directories(libcheckpoint_v1 INTERFACE
+        "${GAP_RUNNER_SOURCE_DIR}/common"
+    )
+
+    add_library(libcheckpoint_v2 SHARED IMPORTED GLOBAL)
+    set_target_properties(libcheckpoint_v2 PROPERTIES
+        IMPORTED_LOCATION "${CHECKPOINT_V2_LIB_PATH}"
+    )
+    target_include_directories(libcheckpoint_v2 INTERFACE
         "${GAP_RUNNER_SOURCE_DIR}/common"
     )
 
     target_compile_definitions(FMI PRIVATE LINK_WITH_CHECKPOINTING_LIB=1)
-    target_link_libraries(FMI libcheckpoint)
+    target_link_libraries(FMI libcheckpoint_v1 libcheckpoint_v2)
     target_include_directories(FMI PRIVATE "${GAP_RUNNER_SOURCE_DIR}/lib")
 endif()
 

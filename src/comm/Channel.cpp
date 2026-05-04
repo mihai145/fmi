@@ -9,7 +9,7 @@
 #endif
 
 #if LINK_WITH_CHECKPOINTING_LIB
-#include "../../include/comm/DirectNoHolepunch.h"
+#include "../../include/comm/RedisCheckpoint.h"
 #endif
 
 std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name, std::map<std::string, std::string> params,
@@ -27,8 +27,8 @@ std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string 
     }
     #endif
     #if LINK_WITH_CHECKPOINTING_LIB
-    else if (name == "DirectNoHolepunch") {
-        return std::make_shared<DirectNoHolepunch>(params, model_params);
+    else if (name == "RedisCheckpoint") {
+        return std::make_shared<RedisCheckpoint>(params, model_params);
     }
     #endif
     else {
