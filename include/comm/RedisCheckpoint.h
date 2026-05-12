@@ -2,17 +2,20 @@
 #define FMI_REDIS_CHECKPOINT_H
 
 #include "ClientServer.h"
+#include <hiredis/hiredis.h>
 #include <map>
 #include <string>
-#include <hiredis/hiredis.h>
 
 #include "checkpoint_v2.hpp"
 
 namespace FMI::Comm {
-    //! Checkpointable channel that uses Redis with the Hiredis client library as storage backend.
+    //! Checkpointable channel that uses Redis with the Hiredis client library
+    //! as storage backend.
     class RedisCheckpoint : public ClientServer {
-    public:
-        explicit RedisCheckpoint(std::map<std::string, std::string> params, std::map<std::string, std::string> model_params);
+      public:
+        explicit RedisCheckpoint(
+            std::map<std::string, std::string> params,
+            std::map<std::string, std::string> model_params);
 
         ~RedisCheckpoint();
 
@@ -24,14 +27,16 @@ namespace FMI::Comm {
 
         std::vector<std::string> get_object_names() override;
 
-        double get_latency(Utils::peer_num producer, Utils::peer_num consumer, std::size_t size_in_bytes) override;
+        double get_latency(Utils::peer_num producer, Utils::peer_num consumer,
+                           std::size_t size_in_bytes) override;
 
-        double get_price(Utils::peer_num producer, Utils::peer_num consumer, std::size_t size_in_bytes) override;
+        double get_price(Utils::peer_num producer, Utils::peer_num consumer,
+                         std::size_t size_in_bytes) override;
 
-    private:
+      private:
         std::string hostname;
         int port;
-        redisContext* context;
+        redisContext *context;
 
         // Model params
         double bandwidth_single;
@@ -49,6 +54,6 @@ namespace FMI::Comm {
         void teardown_fn();
         void restore_fn();
     };
-}
+} // namespace FMI::Comm
 
-#endif //FMI_REDIS_CHECKPOINT_H
+#endif // FMI_REDIS_CHECKPOINT_H

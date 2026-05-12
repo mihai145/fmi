@@ -35,11 +35,17 @@ void FMI::Comm::RedisCheckpoint::upload_object(channel_data buf,
     std::string command = "SET " + name + " %b";
     auto *reply =
         (redisReply *)redisCommand(context, command.c_str(), buf.buf, buf.len);
-    if (reply->type == REDIS_REPLY_ERROR) {
+    bool ok = reply->type != REDIS_REPLY_ERROR;
+    if (!ok)
         BOOST_LOG_TRIVIAL(error)
             << "Error when uploading to Redis: " << reply->str;
-    }
     freeReplyObject(reply);
+    UninterruptibleContextState hint;
+    strncpy(hint.fname, name.c_str(), sizeof(hint.fname) - 1);
+    hint.fname[sizeof(hint.fname) - 1] = '\0';
+    hint.side = Side::UPLOAD;
+    hint.succeeded = ok;
+    checkpointer->register_hint(hint);
 }
 
 bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf,
@@ -47,14 +53,17 @@ bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf,
     auto ctx = checkpointer->get_uninterruptible_context();
     std::string command = "GET " + name;
     auto *reply = (redisReply *)redisCommand(context, command.c_str());
-    if (reply->type == REDIS_REPLY_NIL || reply->type == REDIS_REPLY_ERROR) {
-        freeReplyObject(reply);
-        return false;
-    } else {
+    bool ok = reply->type != REDIS_REPLY_NIL && reply->type != REDIS_REPLY_ERROR;
+    if (ok)
         std::memcpy(buf.buf, reply->str, std::min(buf.len, reply->len));
-        freeReplyObject(reply);
-        return true;
-    }
+    freeReplyObject(reply);
+    UninterruptibleContextState hint;
+    strncpy(hint.fname, name.c_str(), sizeof(hint.fname) - 1);
+    hint.fname[sizeof(hint.fname) - 1] = '\0';
+    hint.side = Side::DOWNLOAD;
+    hint.succeeded = ok;
+    checkpointer->register_hint(hint);
+    return ok;
 }
 
 void FMI::Comm::RedisCheckpoint::delete_object(std::string name) {
