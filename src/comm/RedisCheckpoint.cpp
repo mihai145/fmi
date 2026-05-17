@@ -24,7 +24,11 @@ FMI::Comm::RedisCheckpoint::RedisCheckpoint(
     restore_fn();
 
     checkpointer = std::make_unique<checkpoint::Checkpointer>(
-        [&] { teardown_fn(); }, [&] { restore_fn(); });
+        [this] {
+            checkpointer->register_hint(state);
+            teardown_fn();
+        },
+        [this] { restore_fn(); });
 }
 
 FMI::Comm::RedisCheckpoint::~RedisCheckpoint() { teardown_fn(); }
@@ -40,12 +44,6 @@ void FMI::Comm::RedisCheckpoint::upload_object(channel_data buf,
         BOOST_LOG_TRIVIAL(error)
             << "Error when uploading to Redis: " << reply->str;
     freeReplyObject(reply);
-    UninterruptibleContextState hint;
-    strncpy(hint.fname, name.c_str(), sizeof(hint.fname) - 1);
-    hint.fname[sizeof(hint.fname) - 1] = '\0';
-    hint.side = Side::UPLOAD;
-    hint.succeeded = ok;
-    checkpointer->register_hint(hint);
 }
 
 bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf,
@@ -53,16 +51,19 @@ bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf,
     auto ctx = checkpointer->get_uninterruptible_context();
     std::string command = "GET " + name;
     auto *reply = (redisReply *)redisCommand(context, command.c_str());
-    bool ok = reply->type != REDIS_REPLY_NIL && reply->type != REDIS_REPLY_ERROR;
+    bool ok =
+        reply->type != REDIS_REPLY_NIL && reply->type != REDIS_REPLY_ERROR;
     if (ok)
         std::memcpy(buf.buf, reply->str, std::min(buf.len, reply->len));
     freeReplyObject(reply);
-    UninterruptibleContextState hint;
-    strncpy(hint.fname, name.c_str(), sizeof(hint.fname) - 1);
-    hint.fname[sizeof(hint.fname) - 1] = '\0';
-    hint.side = Side::DOWNLOAD;
-    hint.succeeded = ok;
-    checkpointer->register_hint(hint);
+
+    try {
+        int peer = std::stoi(name.substr(comm_name.size()));
+        if (peer >= 0 && peer < state.num_peers)
+            state.waiting_for[peer] = !ok;
+    } catch (...) {
+    }
+
     return ok;
 }
 
@@ -81,6 +82,19 @@ std::vector<std::string> FMI::Comm::RedisCheckpoint::get_object_names() {
     for (int i = 0; i < reply->elements; i++) {
         keys.emplace_back(reply->element[i]->str);
     }
+    freeReplyObject(reply);
+
+    if (std::holds_alternative<checkpoint::Barrier>(state.current_state)) {
+        unsigned int barrier_num = num_operations.at("barrier") - 1;
+        std::string barrier_suffix = "_barrier_" + std::to_string(barrier_num);
+        for (int i = 0; i < state.num_peers; i++) {
+            std::string expected =
+                comm_name + std::to_string(i) + barrier_suffix;
+            state.waiting_for[i] =
+                std::find(keys.begin(), keys.end(), expected) == keys.end();
+        }
+    }
+
     return keys;
 }
 

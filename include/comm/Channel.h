@@ -120,7 +120,9 @@ namespace FMI::Comm {
 
         //! Helper utility to set number of peers, needs to be set before first
         //! collective operation
-        void set_num_peers(FMI::Utils::peer_num num) { num_peers = num; }
+        virtual void set_num_peers(FMI::Utils::peer_num num) {
+            num_peers = num;
+        }
 
         //! Helper utility to set the communicator name, should be set before
         //! first collective operation to avoid conflicts with empty

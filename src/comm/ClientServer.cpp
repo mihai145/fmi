@@ -5,6 +5,8 @@
 
 void FMI::Comm::ClientServer::send(channel_data buf,
                                    FMI::Utils::peer_num dest) {
+    enter_state(checkpoint::Send{(int)dest});
+
     auto num_operation_entry =
         num_operations.find("send" + std::to_string(dest));
     unsigned int operation_num;
@@ -19,10 +21,14 @@ void FMI::Comm::ClientServer::send(channel_data buf,
     operation_num++;
     num_operations["send" + std::to_string(dest)] = operation_num;
     upload(buf, file_name);
+
+    exit_state(checkpoint::Send{(int)dest});
 }
 
 void FMI::Comm::ClientServer::recv(channel_data buf,
                                    FMI::Utils::peer_num dest) {
+    enter_state(checkpoint::Recv{(int)dest});
+
     auto num_operation_entry =
         num_operations.find("recv" + std::to_string(dest));
     unsigned int operation_num;
@@ -37,10 +43,14 @@ void FMI::Comm::ClientServer::recv(channel_data buf,
     operation_num++;
     num_operations["recv" + std::to_string(dest)] = operation_num;
     download(buf, file_name);
+
+    exit_state(checkpoint::Recv{(int)dest});
 }
 
 void FMI::Comm::ClientServer::bcast(channel_data buf,
                                     FMI::Utils::peer_num root) {
+    enter_state(checkpoint::Bcast{});
+
     std::string file_name = comm_name + std::to_string(root) + "_bcast_" +
                             std::to_string(num_operations["bcast"]);
     num_operations["bcast"]++;
@@ -49,9 +59,13 @@ void FMI::Comm::ClientServer::bcast(channel_data buf,
     } else {
         download(buf, file_name);
     }
+
+    exit_state(checkpoint::Bcast{});
 }
 
 void FMI::Comm::ClientServer::barrier() {
+    enter_state(checkpoint::Barrier{});
+
     auto barrier_num = num_operations["barrier"];
     std::string barrier_suffix = "_barrier_" + std::to_string(barrier_num);
     std::string file_name =
@@ -70,6 +84,7 @@ void FMI::Comm::ClientServer::barrier() {
         auto num_arrived =
             std::count_if(objects.begin(), objects.end(), has_barrier_suffix);
         if (num_arrived >= num_peers) {
+            exit_state(checkpoint::Barrier{});
             return;
         } else {
             elapsed_time += timeout;
@@ -103,6 +118,8 @@ void FMI::Comm::ClientServer::upload(channel_data buf, std::string name) {
 void FMI::Comm::ClientServer::reduce(channel_data sendbuf, channel_data recvbuf,
                                      FMI::Utils::peer_num root,
                                      raw_function f) {
+    enter_state(checkpoint::Reduce{});
+
     if (peer_id == root) {
         bool left_to_right = !(f.commutative && f.associative);
         std::vector<bool> received(num_peers, false);
@@ -158,10 +175,14 @@ void FMI::Comm::ClientServer::reduce(channel_data sendbuf, channel_data recvbuf,
         num_operations["reduce"]++;
         upload(sendbuf, file_name);
     }
+
+    exit_state(checkpoint::Reduce{});
 }
 
 void FMI::Comm::ClientServer::scan(channel_data sendbuf, channel_data recvbuf,
                                    raw_function f) {
+    enter_state(checkpoint::Scan{});
+
     if (peer_id != num_peers - 1) {
         std::string file_name = comm_name + std::to_string(peer_id) + "_scan_" +
                                 std::to_string(num_operations["scan"]);
@@ -214,6 +235,8 @@ void FMI::Comm::ClientServer::scan(channel_data sendbuf, channel_data recvbuf,
         throw Utils::Timeout();
     }
     num_operations["scan"]++;
+
+    exit_state(checkpoint::Scan{});
 }
 
 FMI::Comm::ClientServer::ClientServer(
@@ -288,4 +311,37 @@ double FMI::Comm::ClientServer::get_operation_price(
         return costs;
     }
     throw std::runtime_error("Operation not implemented");
+}
+
+void FMI::Comm::ClientServer::enter_state(checkpoint::CommPattern op) {
+    auto ctx = checkpointer->get_uninterruptible_context();
+
+    for (int i = 0; i < (int)num_peers; i++)
+        state.waiting_for[i] = false;
+
+    state.current_state = op;
+}
+
+void FMI::Comm::ClientServer::exit_state(checkpoint::CommPattern op) {
+    auto ctx = checkpointer->get_uninterruptible_context();
+
+    for (int i = 0; i < (int)num_peers; i++)
+        state.waiting_for[i] = false;
+
+    if (auto *s = std::get_if<checkpoint::Send>(&op))
+        state.done_send[s->dest]++;
+    else if (auto *r = std::get_if<checkpoint::Recv>(&op))
+        state.done_recv[r->src]++;
+    else if (std::holds_alternative<checkpoint::Bcast>(op))
+        state.done_bcast++;
+    else if (std::holds_alternative<checkpoint::Barrier>(op))
+        state.done_barrier++;
+    else if (std::holds_alternative<checkpoint::Reduce>(op))
+        state.done_reduce++;
+    else if (std::holds_alternative<checkpoint::Allreduce>(op))
+        state.done_allreduce++;
+    else if (std::holds_alternative<checkpoint::Scan>(op))
+        state.done_scan++;
+
+    state.current_state = checkpoint::CPUBound{};
 }

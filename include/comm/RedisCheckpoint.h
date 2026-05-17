@@ -6,8 +6,6 @@
 #include <map>
 #include <string>
 
-#include "checkpoint_v2.hpp"
-
 namespace FMI::Comm {
     //! Checkpointable channel that uses Redis with the Hiredis client library
     //! as storage backend.
@@ -46,9 +44,6 @@ namespace FMI::Comm {
         double instance_price;
         unsigned int requests_per_hour;
         bool include_infrastructure_costs;
-
-        // Checkpointer
-        std::unique_ptr<checkpoint::Checkpointer> checkpointer;
 
         // teardown / restore functions for C/R
         void teardown_fn();
