@@ -1,8 +1,9 @@
 #include "../../include/comm/Channel.h"
-#include "../../include/comm/S3.h"
-#include "../../include/comm/Redis.h"
 #include "../../include/comm/Direct.h"
+#include "../../include/comm/DirectCheckpoint.h"
 #include "../../include/comm/DirectNoHolepunch.h"
+#include "../../include/comm/Redis.h"
+#include "../../include/comm/S3.h"
 
 #if FMI_RDMA
 #include "../../include/comm/Rdma.h"
@@ -12,7 +13,8 @@
 #include "../../include/comm/RedisCheckpoint.h"
 #endif
 
-std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name, std::map<std::string, std::string> params,
+std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name,
+                                                                    std::map<std::string, std::string> params,
                                                                     std::map<std::string, std::string> model_params) {
     if (name == "S3") {
         return std::make_shared<S3>(params, model_params);
@@ -21,16 +23,18 @@ std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string 
     } else if (name == "Direct") {
         return std::make_shared<Direct>(params, model_params);
     }
-    #if FMI_RDMA
+#if FMI_RDMA
     else if (name == "Rdma") {
         return std::make_shared<Rdma>(params);
     }
-    #endif
-    #if LINK_WITH_CHECKPOINTING_LIB
+#endif
+#if LINK_WITH_CHECKPOINTING_LIB
     else if (name == "RedisCheckpoint") {
         return std::make_shared<RedisCheckpoint>(params, model_params);
+    } else if (name == "DirectCheckpoint") {
+        return std::make_shared<DirectCheckpoint>(params, model_params);
     }
-    #endif
+#endif
     else {
         throw std::runtime_error("Unknown channel name passed");
     }
@@ -45,7 +49,7 @@ void FMI::Comm::Channel::gather(channel_data sendbuf, channel_data recvbuf, FMI:
             if (i == root) {
                 std::memcpy(recvbuf.buf + root * buffer_length, sendbuf.buf, buffer_length);
             } else {
-                channel_data peer_data {recvbuf.buf + i * buffer_length, buffer_length};
+                channel_data peer_data{recvbuf.buf + i * buffer_length, buffer_length};
                 recv(peer_data, i);
             }
         }
@@ -59,7 +63,7 @@ void FMI::Comm::Channel::scatter(channel_data sendbuf, channel_data recvbuf, FMI
             if (i == root) {
                 std::memcpy(recvbuf.buf, sendbuf.buf + root * buffer_length, buffer_length);
             } else {
-                channel_data peer_data {sendbuf.buf + i * buffer_length, buffer_length};
+                channel_data peer_data{sendbuf.buf + i * buffer_length, buffer_length};
                 send(peer_data, i);
             }
         }
