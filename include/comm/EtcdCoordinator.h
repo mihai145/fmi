@@ -46,7 +46,7 @@ namespace FMI::Comm {
         std::map<int, Entry> known_state;
         std::deque<WatchEvent> event_queue;
 
-        std::vector<Entry> fetch_range();
+        std::vector<Entry> fetch_range(int timeout_ms);
     };
 
 } // namespace FMI::Comm

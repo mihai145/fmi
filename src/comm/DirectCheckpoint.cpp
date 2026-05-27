@@ -6,15 +6,19 @@
 #include <chrono>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_set>
 
 namespace {
     constexpr int RCVTIMEO_US = 5 * 1000;
     constexpr int DRAIN_RCVTIMEO_US = 500 * 1000;
-    constexpr int LISTENER_POLL_MS = 100;
+    constexpr int LISTENER_POLL_MS = 15;
     constexpr int ETCD_POLL_MS = 200;
+    constexpr int MISSING_CONN_SLEEP_MS = 1;
+    constexpr int CONNECT_TO_FAILURE_BACKOFF_MS = 100;
 } // namespace
 
 namespace FMI::Comm {
@@ -84,7 +88,7 @@ namespace FMI::Comm {
             }
 
             if (need_sleep)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
         }
 
         BOOST_LOG_TRIVIAL(info) << "send_object(): Sent data to " << rcpt_id;
@@ -150,7 +154,7 @@ namespace FMI::Comm {
             }
 
             if (need_sleep)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
         }
 
         BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
@@ -201,63 +205,125 @@ namespace FMI::Comm {
     }
 
     void DirectCheckpoint::handle_listener() {
-        struct pollfd pfd{listener_fd, POLLIN, 0};
+        int epfd = ::epoll_create1(0);
+        if (epfd < 0) {
+            BOOST_LOG_TRIVIAL(error) << "handle_listener(): epoll_create1 failed";
+            return;
+        }
+
+        struct epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = listener_fd;
+        ::epoll_ctl(epfd, EPOLL_CTL_ADD, listener_fd, &ev);
+
+        // fds accepted but not yet identified (handshake recv pending)
+        std::unordered_set<int> pending;
+
+        struct epoll_event events[16];
 
         while (!shutdown.load()) {
-            if (::poll(&pfd, 1, LISTENER_POLL_MS) <= 0)
+            int n = ::epoll_wait(epfd, events, 16, LISTENER_POLL_MS);
+            if (n <= 0)
                 continue;
 
-            struct sockaddr_in src{};
-            socklen_t src_len = sizeof(src);
-            int new_fd = ::accept(listener_fd, (struct sockaddr *)&src, &src_len);
-            if (new_fd < 0)
-                continue;
+            for (int i = 0; i < n; i++) {
+                int fd = events[i].data.fd;
 
-            BOOST_LOG_TRIVIAL(info) << "handle_listener(): New peer connected";
-            struct timeval tv{0, RCVTIMEO_US};
-            setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                if (fd == listener_fd) {
+                    struct sockaddr_in src{};
+                    socklen_t src_len = sizeof(src);
+                    int new_fd = ::accept(listener_fd, (struct sockaddr *)&src, &src_len);
+                    if (new_fd < 0)
+                        continue;
 
-            int peer_func_id;
-            if (::recv(new_fd, &peer_func_id, sizeof(peer_func_id), MSG_WAITALL) != sizeof(peer_func_id)) {
-                BOOST_LOG_TRIVIAL(info) << "handle_listener(): Peer did not send identification successfully";
-                ::close(new_fd);
-                continue;
-            }
+                    struct timeval tv{0, RCVTIMEO_US};
+                    setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-            {
-                BOOST_LOG_TRIVIAL(info) << "handle_listener(): Peer with id " << peer_func_id << " connected";
-                std::lock_guard<std::mutex> lock(connections_lock);
-                if (connections.find(peer_func_id) == connections.end())
-                    connections[peer_func_id] = {new_fd, "", 0}; // listening port unknown for accepted connections
-                else {
-                    BOOST_LOG_TRIVIAL(error)
-                        << "handle_listener(): Peer with id " << peer_func_id << " already connected";
-                    ::close(new_fd);
+                    struct epoll_event nev{};
+                    nev.events = EPOLLIN;
+                    nev.data.fd = new_fd;
+                    ::epoll_ctl(epfd, EPOLL_CTL_ADD, new_fd, &nev);
+                    pending.insert(new_fd);
+
+                    BOOST_LOG_TRIVIAL(info) << "handle_listener(): New peer connected";
+                } else {
+                    // handshake ready: remove from epoll before recv
+                    ::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    pending.erase(fd);
+
+                    int peer_func_id;
+                    if (::recv(fd, &peer_func_id, sizeof(peer_func_id), MSG_WAITALL) != sizeof(peer_func_id)) {
+                        BOOST_LOG_TRIVIAL(info) << "handle_listener(): Peer did not send identification successfully";
+                        ::close(fd);
+                        continue;
+                    }
+
+                    BOOST_LOG_TRIVIAL(info) << "handle_listener(): Peer with id " << peer_func_id << " connected";
+                    std::lock_guard<std::mutex> lock(connections_lock);
+                    if (connections.find(peer_func_id) == connections.end())
+                        connections[peer_func_id] = {fd, "", 0};
+                    else {
+                        BOOST_LOG_TRIVIAL(error)
+                            << "handle_listener(): Peer with id " << peer_func_id << " already connected";
+                        ::close(fd);
+                    }
                 }
             }
         }
 
+        for (int fd : pending)
+            ::close(fd);
+        ::close(epfd);
         ::close(listener_fd);
         listener_fd = -1;
         BOOST_LOG_TRIVIAL(info) << "handle_listener(): Thread stopped handling connections";
     }
 
     void DirectCheckpoint::handle_etcd() {
+        struct PendingRetry {
+            std::string address;
+            int port;
+            std::chrono::steady_clock::time_point next_retry;
+        };
+        std::unordered_map<int, PendingRetry> pending;
+
         // Read current state before watching so we don't miss peers that registered
         // while we were checkpointed.
         for (const auto &entry : coordinator->get_entries()) {
-            if (entry.func_id != func_id && func_id < entry.func_id)
-                connect_to(entry.func_id, entry.address, entry.port);
+            if (entry.func_id != func_id && func_id < entry.func_id) {
+                if (!connect_to(entry.func_id, entry.address, entry.port))
+                    pending[entry.func_id] = {entry.address, entry.port,
+                                              std::chrono::steady_clock::now() +
+                                                  std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS)};
+            }
         }
 
         while (!shutdown.load()) {
             auto ev = coordinator->next_event(ETCD_POLL_MS);
+
+            // handle retries first
+            auto now = std::chrono::steady_clock::now();
+            for (auto it = pending.begin(); it != pending.end();) {
+                if (now >= it->second.next_retry) {
+                    if (connect_to(it->first, it->second.address, it->second.port)) {
+                        it = pending.erase(it);
+                    } else {
+                        it->second.next_retry = now + std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS);
+                        ++it;
+                    }
+                } else {
+                    ++it;
+                }
+            }
+
             if (!ev)
                 continue;
 
             const auto &entry = ev->entry;
             if (entry.func_id == func_id)
                 continue;
+
+            pending.erase(entry.func_id);
 
             if (ev->type == EventType::PUT) {
                 BOOST_LOG_TRIVIAL(info) << "handle_etcd(): PUT event for peer " << entry.func_id << ", address "
@@ -280,7 +346,9 @@ namespace FMI::Comm {
                         }
 
                         BOOST_LOG_TRIVIAL(info) << "handle_etcd(): PUT -> Connect to " << entry.func_id;
-                        connect_to(entry.func_id, entry.address, entry.port);
+                        if (!connect_to(entry.func_id, entry.address, entry.port))
+                            pending[entry.func_id] = {entry.address, entry.port,
+                                                      now + std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS)};
                     }
                 }
             } else { // DELETE
@@ -293,64 +361,59 @@ namespace FMI::Comm {
     }
 
     int DirectCheckpoint::bind_and_listen() {
-        srand(time(nullptr));
-
-        const int MAX_BIND_LISTEN_TRIES = 50;
-        const int TCP_PORT_LB = 10000;
-        const int TCP_PORT_RANGE = 10000;
-
-        for (int i = 0; i < MAX_BIND_LISTEN_TRIES; i++) {
-            int port = TCP_PORT_LB + rand() % TCP_PORT_RANGE;
-
-            int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (fd < 0) {
-                BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed socket()";
-                continue;
-            }
-
-            int one = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-            struct sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = INADDR_ANY;
-            addr.sin_port = htons(port);
-
-            if (::bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed bind()";
-                ::close(fd);
-                continue;
-            }
-
-            if (::listen(fd, SOMAXCONN) < 0) {
-                BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed listen()";
-                ::close(fd);
-                continue;
-            }
-
-            listener_fd = fd;
-            return port;
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed socket()";
+            return -1;
         }
 
-        return -1;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(0); // let the OS pick a free port
+
+        if (::bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed bind()";
+            ::close(fd);
+            return -1;
+        }
+
+        if (::listen(fd, SOMAXCONN) < 0) {
+            BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed listen()";
+            ::close(fd);
+            return -1;
+        }
+
+        socklen_t len = sizeof(addr);
+        if (::getsockname(fd, (struct sockaddr *)&addr, &len) < 0) {
+            BOOST_LOG_TRIVIAL(warning) << "bind_and_listen(): failed getsockname()";
+            ::close(fd);
+            return -1;
+        }
+
+        listener_fd = fd;
+        return ntohs(addr.sin_port);
     }
 
-    void DirectCheckpoint::connect_to(int peer_id, const std::string &address, int port) {
+    bool DirectCheckpoint::connect_to(int peer_id, const std::string &address, int port) {
         if (func_id >= peer_id) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): Only connecting to peers with higher id";
-            return;
+            return false;
         }
 
         {
             std::lock_guard<std::mutex> lock(connections_lock);
             if (connections.count(peer_id) > 0)
-                return;
+                return true;
         }
 
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): failed socket() for peer " << peer_id;
-            return;
+            return false;
         }
 
         struct sockaddr_in dest{};
@@ -359,13 +422,13 @@ namespace FMI::Comm {
         if (::inet_pton(AF_INET, address.c_str(), &dest.sin_addr) <= 0) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): failed inet_pton() for peer " << peer_id;
             ::close(fd);
-            return;
+            return false;
         }
 
         if (::connect(fd, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): failed connect() for peer " << peer_id;
             ::close(fd);
-            return;
+            return false;
         }
 
         struct timeval tv{0, RCVTIMEO_US};
@@ -374,16 +437,17 @@ namespace FMI::Comm {
         if (::send(fd, &func_id, sizeof(func_id), 0) != sizeof(func_id)) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): failed send() for peer " << peer_id;
             ::close(fd);
-            return;
+            return false;
         }
 
         std::lock_guard<std::mutex> lock(connections_lock);
         if (connections.count(peer_id) > 0) {
             BOOST_LOG_TRIVIAL(error) << "connect_to(): Peer with id " << peer_id << " already connected";
             ::close(fd);
-            return;
+            return true;
         }
         connections[peer_id] = {fd, address, port};
+        return true;
     }
 
     void DirectCheckpoint::drain_connection(int peer_id) {

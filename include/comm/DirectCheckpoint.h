@@ -55,7 +55,7 @@ namespace FMI::Comm {
         void handle_etcd();
 
         int bind_and_listen();
-        void connect_to(int peer_id, const std::string &address, int port);
+        bool connect_to(int peer_id, const std::string &address, int port);
         void drain_connection(int peer_id);
     };
 } // namespace FMI::Comm
