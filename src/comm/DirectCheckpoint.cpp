@@ -32,6 +32,9 @@ namespace FMI::Comm {
     }
 
     DirectCheckpoint::~DirectCheckpoint() {
+        if (checkpointer)
+            checkpointer->shutdown_ctrl_thread();
+
         shutdown.store(true);
         if (listener_thread.joinable())
             listener_thread.join();
