@@ -11,7 +11,7 @@
 
 namespace {
 
-    constexpr int CURL_TIMEOUT_MS = 1000;
+    constexpr int CURL_TIMEOUT_MS = 3000;
 
     std::string b64_encode(const std::string &in) {
         std::string out(4 * ((in.size() + 2) / 3), '\0');

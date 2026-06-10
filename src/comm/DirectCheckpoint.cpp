@@ -18,6 +18,7 @@ namespace {
     constexpr int LISTENER_POLL_MS = 15;
     constexpr int ETCD_POLL_MS = 200;
     constexpr int MISSING_CONN_SLEEP_MS = 1;
+    constexpr int ADVERTISE_RETRIES = 10;
     constexpr int CONNECT_TO_FAILURE_BACKOFF_MS = 100;
 } // namespace
 
@@ -172,7 +173,11 @@ namespace FMI::Comm {
     void DirectCheckpoint::teardown_fn() {
         shutdown.store(true);
 
-        coordinator->delete_own_key(func_id);
+        try {
+            coordinator->delete_own_key(func_id);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "teardown_fn(): delete_own_key failed: " << e.what();
+        }
 
         if (listener_thread.joinable())
             listener_thread.join();
@@ -199,7 +204,18 @@ namespace FMI::Comm {
         listener_thread = std::thread(&DirectCheckpoint::handle_listener, this);
 
         coordinator = std::make_unique<EtcdCoordinator>(etcd_host, etcd_port, comm_name);
-        coordinator->advertise_own_key(func_id, listener_port);
+        for (int attempt = 1;; attempt++) {
+            try {
+                coordinator->advertise_own_key(func_id, listener_port);
+                break;
+            } catch (const std::exception &e) {
+                if (attempt == ADVERTISE_RETRIES)
+                    throw;
+                BOOST_LOG_TRIVIAL(warning)
+                    << "restore_fn(): advertise_own_key failed (attempt " << attempt << "): " << e.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(ETCD_POLL_MS));
+            }
+        }
 
         etcd_thread = std::thread(&DirectCheckpoint::handle_etcd, this);
     }
@@ -316,8 +332,10 @@ namespace FMI::Comm {
                 }
             }
 
-            if (!ev)
+            if (!ev) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ETCD_POLL_MS));
                 continue;
+            }
 
             const auto &entry = ev->entry;
             if (entry.func_id == func_id)
