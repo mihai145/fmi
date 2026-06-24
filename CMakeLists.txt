@@ -47,8 +47,6 @@ else()
 endif()
 
 if(LINK_WITH_CHECKPOINTING_LIB)
-    list(APPEND FMI_SOURCES src/comm/CheckpointablePeerToPeer.cpp)
-    list(APPEND FMI_SOURCES src/comm/DirectNoHolepunch.cpp)
     list(APPEND FMI_SOURCES src/comm/RedisCheckpoint.cpp)
     list(APPEND FMI_SOURCES src/comm/DirectCheckpoint.cpp)
     list(APPEND FMI_SOURCES src/comm/EtcdCoordinator.cpp)
@@ -82,28 +80,13 @@ if(LINK_WITH_CHECKPOINTING_LIB)
     set(GAP_RUNNER_SOURCE_DIR "${REPO_ROOT}/src")
     set(GAP_RUNNER_BUILD_DIR  "${REPO_ROOT}/build/scheduler")
 
-    set(CHECKPOINT_V1_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint_v1.so")
     set(CHECKPOINT_V2_LIB_PATH "${GAP_RUNNER_BUILD_DIR}/libcheckpoint_v2.so")
-
-    if(NOT EXISTS "${CHECKPOINT_V1_LIB_PATH}")
-        message(FATAL_ERROR "Missing ${CHECKPOINT_V1_LIB_PATH}. Build scheduler first.")
-    else()
-        message(STATUS "Found libcheckpoint_v1.")
-    endif()
 
     if(NOT EXISTS "${CHECKPOINT_V2_LIB_PATH}")
         message(FATAL_ERROR "Missing ${CHECKPOINT_V2_LIB_PATH}. Build scheduler first.")
     else()
         message(STATUS "Found libcheckpoint_v2.")
     endif()
-
-    add_library(libcheckpoint_v1 SHARED IMPORTED GLOBAL)
-    set_target_properties(libcheckpoint_v1 PROPERTIES
-        IMPORTED_LOCATION "${CHECKPOINT_V1_LIB_PATH}"
-    )
-    target_include_directories(libcheckpoint_v1 INTERFACE
-        "${GAP_RUNNER_SOURCE_DIR}/common"
-    )
 
     add_library(libcheckpoint_v2 SHARED IMPORTED GLOBAL)
     set_target_properties(libcheckpoint_v2 PROPERTIES
@@ -114,7 +97,7 @@ if(LINK_WITH_CHECKPOINTING_LIB)
     )
 
     target_compile_definitions(FMI PRIVATE LINK_WITH_CHECKPOINTING_LIB=1)
-    target_link_libraries(FMI libcheckpoint_v1 libcheckpoint_v2 ${CURL_LIBRARIES} OpenSSL::Crypto)
+    target_link_libraries(FMI libcheckpoint_v2 ${CURL_LIBRARIES} OpenSSL::Crypto)
     target_include_directories(FMI PRIVATE "${GAP_RUNNER_SOURCE_DIR}/lib" "${GAP_RUNNER_SOURCE_DIR}/common" ${CURL_INCLUDE_DIRS})
 endif()
 

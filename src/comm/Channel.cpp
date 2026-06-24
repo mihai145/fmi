@@ -1,7 +1,6 @@
 #include "../../include/comm/Channel.h"
 #include "../../include/comm/Direct.h"
 #include "../../include/comm/DirectCheckpoint.h"
-#include "../../include/comm/DirectNoHolepunch.h"
 #include "../../include/comm/Redis.h"
 #include "../../include/comm/S3.h"
 
