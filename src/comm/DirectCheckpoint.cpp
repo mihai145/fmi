@@ -18,9 +18,11 @@ namespace {
     constexpr int RCVTIMEO_US = 5 * 1000;
     constexpr int DRAIN_BUDGET_MS = 300;
     constexpr int DRAIN_RCVTIMEO_US = DRAIN_BUDGET_MS * 1000;
+    constexpr int DRAIN_SAFETY_MS = 5000;
     constexpr int LISTENER_POLL_MS = 15;
     constexpr int ETCD_POLL_MS = 200;
     constexpr int MISSING_CONN_SLEEP_MS = 1;
+    constexpr int POLL_TIMEOUT_MS = 100;
     constexpr int ADVERTISE_RETRIES = 10;
     constexpr int CONNECT_TO_FAILURE_BACKOFF_MS = 100;
 } // namespace
@@ -54,12 +56,11 @@ namespace FMI::Comm {
         int sent = 0;
 
         while (sent < (int)buf.len) {
-            bool need_sleep = false;
+            int fd = -1;
+            bool blocked = false;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
 
-                // find connection
-                int fd = -1;
                 {
                     std::lock_guard<std::mutex> lock(connections_lock);
                     auto it = connections.find(rcpt_id);
@@ -67,33 +68,33 @@ namespace FMI::Comm {
                         fd = it->second.fd;
                 }
 
-                if (fd == -1) {
-                    BOOST_LOG_TRIVIAL(info) << "send_object(): No connection to " << rcpt_id;
-                    need_sleep = true;
-                } else {
-                    while (true) {
-                        ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
-                        if (n > 0) {
-                            sent += n;
-                            if (sent == (int)buf.len)
-                                break;
-                        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                            need_sleep = true;
-                            break;
-                        } else {
-                            BOOST_LOG_TRIVIAL(info)
-                                << "send_object(): Got errno " << errno << " while sending data to " << rcpt_id;
-                            std::lock_guard<std::mutex> lock(connections_lock);
-                            connections.erase(rcpt_id);
+                if (fd != -1) {
+                    ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+                    if (n > 0) {
+                        sent += n;
+                        continue;
+                    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        blocked = true;
+                    } else {
+                        BOOST_LOG_TRIVIAL(info)
+                            << "send_object(): Got errno " << errno << " while sending data to " << rcpt_id;
+                        std::lock_guard<std::mutex> lock(connections_lock);
+                        auto it = connections.find(rcpt_id);
+                        if (it != connections.end() && it->second.fd == fd) {
+                            connections.erase(it);
                             ::close(fd);
-                            break;
                         }
+                        fd = -1;
                     }
                 }
             }
 
-            if (need_sleep)
+            if (fd == -1)
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
+            else if (blocked) {
+                struct pollfd pfd{fd, POLLOUT, 0};
+                ::poll(&pfd, 1, POLL_TIMEOUT_MS);
+            }
         }
 
         BOOST_LOG_TRIVIAL(info) << "send_object(): Sent data to " << rcpt_id;
@@ -103,30 +104,26 @@ namespace FMI::Comm {
         int recvd = 0;
 
         while (recvd < (int)buf.len) {
-            // Drain bytes saved during teardown first
-            {
-                std::lock_guard<std::mutex> lock(recv_buffers_lock);
-                auto it = recv_buffers.find(sender_id);
-                if (it != recv_buffers.end() && !it->second.empty()) {
-                    auto &q = it->second;
-                    int to_copy = std::min((int)q.size(), (int)buf.len - recvd);
-                    std::copy(q.begin(), q.begin() + to_copy, buf.buf + recvd);
-                    q.erase(q.begin(), q.begin() + to_copy);
-                    recvd += to_copy;
-
-                    BOOST_LOG_TRIVIAL(info) << "recv_object(): Drained " << to_copy << " bytes from " << sender_id;
-                }
-            }
-
-            if (recvd == (int)buf.len)
-                break;
-
-            bool need_sleep = false;
+            int fd = -1;
+            bool blocked = false;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
 
-                // find connection
-                int fd = -1;
+                {
+                    std::lock_guard<std::mutex> lock(recv_buffers_lock);
+                    auto it = recv_buffers.find(sender_id);
+                    if (it != recv_buffers.end() && !it->second.empty()) {
+                        auto &q = it->second;
+                        int to_copy = std::min((int)q.size(), (int)buf.len - recvd);
+                        std::copy(q.begin(), q.begin() + to_copy, buf.buf + recvd);
+                        q.erase(q.begin(), q.begin() + to_copy);
+                        recvd += to_copy;
+
+                        BOOST_LOG_TRIVIAL(info) << "recv_object(): Drained " << to_copy << " bytes from " << sender_id;
+                        continue;
+                    }
+                }
+
                 {
                     std::lock_guard<std::mutex> lock(connections_lock);
                     auto it = connections.find(sender_id);
@@ -134,33 +131,33 @@ namespace FMI::Comm {
                         fd = it->second.fd;
                 }
 
-                if (fd == -1) {
-                    BOOST_LOG_TRIVIAL(info) << "recv_object(): No connection to " << sender_id;
-                    need_sleep = true;
-                } else {
-                    while (true) {
-                        ssize_t n = ::recv(fd, buf.buf + recvd, buf.len - recvd, 0);
-                        if (n > 0) {
-                            recvd += n;
-                            if (recvd == (int)buf.len)
-                                break;
-                        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                            need_sleep = true;
-                            break;
-                        } else {
-                            BOOST_LOG_TRIVIAL(info)
-                                << "recv_object(): Got errno " << errno << " while recv data from " << sender_id;
-                            std::lock_guard<std::mutex> lock(connections_lock);
-                            connections.erase(sender_id);
+                if (fd != -1) {
+                    ssize_t n = ::recv(fd, buf.buf + recvd, buf.len - recvd, MSG_DONTWAIT);
+                    if (n > 0) {
+                        recvd += n;
+                        continue;
+                    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        blocked = true;
+                    } else {
+                        BOOST_LOG_TRIVIAL(info) << "recv_object(): connection to " << sender_id
+                                                << " closed/error (n=" << n << ", errno=" << errno << ")";
+                        std::lock_guard<std::mutex> lock(connections_lock);
+                        auto it = connections.find(sender_id);
+                        if (it != connections.end() && it->second.fd == fd) {
+                            connections.erase(it);
                             ::close(fd);
-                            break;
                         }
+                        fd = -1;
                     }
                 }
             }
 
-            if (need_sleep)
+            if (fd == -1)
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
+            else if (blocked) {
+                struct pollfd pfd{fd, POLLIN, 0};
+                ::poll(&pfd, 1, POLL_TIMEOUT_MS);
+            }
         }
 
         BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
@@ -578,7 +575,11 @@ namespace FMI::Comm {
         for (const auto &d : draining)
             ::shutdown(d.fd, SHUT_WR);
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DRAIN_BUDGET_MS);
+        auto metrics = common::func_metrics(std::to_string(checkpointer->get_job_id()),
+                                            std::to_string(checkpointer->get_func_id()));
+        auto m_drain = metrics.start("drain_all");
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DRAIN_SAFETY_MS);
         char tmp[4096];
         size_t remaining = draining.size();
 
@@ -587,7 +588,7 @@ namespace FMI::Comm {
                 (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
                     .count();
             if (timeout <= 0)
-                break;
+                break; // safety deadline hit
 
             std::vector<struct pollfd> pfds;
             std::vector<Draining *> slots;
@@ -601,8 +602,14 @@ namespace FMI::Comm {
             }
 
             int r = ::poll(pfds.data(), pfds.size(), timeout);
-            if (r <= 0)
-                break; // timeout or error: stop waiting on whatever is left
+            if (r < 0) {
+                if (errno == EINTR)
+                    continue;
+                BOOST_LOG_TRIVIAL(warning) << "drain_all(): poll failed: errno " << errno;
+                break;
+            }
+            if (r == 0)
+                break;
 
             for (size_t i = 0; i < pfds.size(); i++) {
                 if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR)))
@@ -616,11 +623,13 @@ namespace FMI::Comm {
                         auto &q = recv_buffers[d->peer_id];
                         q.insert(q.end(), tmp, tmp + n);
                     } else if (n == 0) {
-                        d->open = false; // clean EOF: peer closed its write side
+                        d->open = false; // clean EOF: fully drained
                         break;
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break; // nothing more for now: keep waiting on this fd
+                        break; // nothing available right now: keep the fd and poll again
                     } else {
+                        BOOST_LOG_TRIVIAL(warning) << "drain_all(): recv error from " << d->peer_id << ": errno "
+                                                   << errno << " -- closing before EOF, bytes may be lost";
                         d->open = false;
                         break;
                     }
@@ -633,9 +642,18 @@ namespace FMI::Comm {
             }
         }
 
+        if (remaining > 0)
+            BOOST_LOG_TRIVIAL(warning) << "drain_all(): " << remaining << " of " << draining.size()
+                                       << " peers did not reach EOF within " << DRAIN_SAFETY_MS
+                                       << "ms; force-closing -- in-flight bytes may be lost";
+
         for (const auto &d : draining)
             if (d.open)
                 ::close(d.fd);
+
+        m_drain.extra("peers", std::to_string(draining.size()));
+        m_drain.extra("forced", std::to_string(remaining));
+        m_drain.stop();
     }
 
 } // namespace FMI::Comm
