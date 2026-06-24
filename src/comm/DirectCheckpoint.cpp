@@ -206,6 +206,14 @@ namespace FMI::Comm {
         }
 
         {
+            // Close the persistent /v3/watch connection
+            auto m = metrics.start("teardown_stop_watch");
+            if (coordinator)
+                coordinator->stop_watch();
+            m.stop();
+        }
+
+        {
             auto m = metrics.start("teardown_drain");
             std::vector<int> peer_ids;
             for (const auto &[id, _] : connections)
@@ -329,7 +337,29 @@ namespace FMI::Comm {
 
         // Read current state before watching so we don't miss peers that registered
         // while we were checkpointed.
-        for (const auto &entry : coordinator->get_entries()) {
+        std::vector<Entry> entries;
+        {
+            auto metrics = common::func_metrics(getenv("job_id"), std::to_string(func_id));
+            auto m = metrics.start("etcd_get_entries");
+            for (int attempt = 1;; attempt++) {
+                try {
+                    entries = coordinator->get_entries();
+                    break;
+                } catch (const std::exception &e) {
+                    if (attempt == ADVERTISE_RETRIES) {
+                        BOOST_LOG_TRIVIAL(error) << "handle_etcd(): get_entries failed after retries: " << e.what();
+                        m.stop();
+                        return;
+                    }
+                    BOOST_LOG_TRIVIAL(warning)
+                        << "handle_etcd(): get_entries failed (attempt " << attempt << "): " << e.what();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS));
+                }
+            }
+            m.stop();
+        }
+
+        for (const auto &entry : entries) {
             if (entry.func_id != func_id && func_id < entry.func_id) {
                 if (!connect_to(entry.func_id, entry.address, entry.port))
                     pending[entry.func_id] = {entry.address, entry.port,
@@ -338,8 +368,13 @@ namespace FMI::Comm {
             }
         }
 
+        coordinator->start_watch();
+
         while (!shutdown.load()) {
-            auto ev = coordinator->next_event(ETCD_POLL_MS);
+            // next_event() blocks until an event or the timeout
+            // wake often enough to retry pending connects
+            int timeout = pending.empty() ? ETCD_POLL_MS : CONNECT_TO_FAILURE_BACKOFF_MS;
+            auto ev = coordinator->next_event(timeout);
 
             // handle retries first
             auto now = std::chrono::steady_clock::now();
@@ -356,10 +391,8 @@ namespace FMI::Comm {
                 }
             }
 
-            if (!ev) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(ETCD_POLL_MS));
+            if (!ev)
                 continue;
-            }
 
             const auto &entry = ev->entry;
             if (entry.func_id == func_id)
