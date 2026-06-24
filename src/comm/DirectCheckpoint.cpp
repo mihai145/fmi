@@ -1,5 +1,7 @@
 #include "../../include/comm/DirectCheckpoint.h"
 
+#include "utils.hpp"
+
 #include <arpa/inet.h>
 #include <boost/log/trivial.hpp>
 #include <cerrno>
@@ -14,7 +16,8 @@
 
 namespace {
     constexpr int RCVTIMEO_US = 5 * 1000;
-    constexpr int DRAIN_RCVTIMEO_US = 500 * 1000;
+    constexpr int DRAIN_BUDGET_MS = 300;
+    constexpr int DRAIN_RCVTIMEO_US = DRAIN_BUDGET_MS * 1000;
     constexpr int LISTENER_POLL_MS = 15;
     constexpr int ETCD_POLL_MS = 200;
     constexpr int MISSING_CONN_SLEEP_MS = 1;
@@ -69,13 +72,14 @@ namespace FMI::Comm {
                     need_sleep = true;
                 } else {
                     while (true) {
-                        ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL);
+                        ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
                         if (n > 0) {
                             sent += n;
                             if (sent == (int)buf.len)
                                 break;
-                        } else if (n < 0 && errno == EAGAIN) {
-                            continue;
+                        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            need_sleep = true;
+                            break;
                         } else {
                             BOOST_LOG_TRIVIAL(info)
                                 << "send_object(): Got errno " << errno << " while sending data to " << rcpt_id;
@@ -141,6 +145,7 @@ namespace FMI::Comm {
                             if (recvd == (int)buf.len)
                                 break;
                         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            need_sleep = true;
                             break;
                         } else {
                             BOOST_LOG_TRIVIAL(info)
@@ -173,22 +178,41 @@ namespace FMI::Comm {
     void DirectCheckpoint::teardown_fn() {
         shutdown.store(true);
 
-        try {
-            coordinator->delete_own_key(func_id);
-        } catch (const std::exception &e) {
-            BOOST_LOG_TRIVIAL(warning) << "teardown_fn(): delete_own_key failed: " << e.what();
+        auto metrics = common::func_metrics(std::to_string(checkpointer->get_job_id()),
+                                            std::to_string(checkpointer->get_func_id()));
+
+        {
+            auto m = metrics.start("teardown_delete_key");
+            try {
+                coordinator->delete_own_key(func_id);
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "teardown_fn(): delete_own_key failed: " << e.what();
+            }
+            m.stop();
         }
 
-        if (listener_thread.joinable())
-            listener_thread.join();
-        if (etcd_thread.joinable())
-            etcd_thread.join();
+        {
+            auto m = metrics.start("teardown_join_listener");
+            if (listener_thread.joinable())
+                listener_thread.join();
+            m.stop();
+        }
 
-        std::vector<int> peer_ids;
-        for (const auto &[id, _] : connections)
-            peer_ids.push_back(id);
-        for (int id : peer_ids)
-            drain_connection(id);
+        {
+            auto m = metrics.start("teardown_join_etcd");
+            if (etcd_thread.joinable())
+                etcd_thread.join();
+            m.stop();
+        }
+
+        {
+            auto m = metrics.start("teardown_drain");
+            std::vector<int> peer_ids;
+            for (const auto &[id, _] : connections)
+                peer_ids.push_back(id);
+            drain_all(peer_ids);
+            m.stop();
+        }
     }
 
     void DirectCheckpoint::restore_fn() {
@@ -497,6 +521,88 @@ namespace FMI::Comm {
         }
 
         ::close(fd);
+    }
+
+    void DirectCheckpoint::drain_all(const std::vector<int> &peer_ids) {
+        struct Draining {
+            int fd;
+            int peer_id;
+            bool open;
+        };
+
+        std::vector<Draining> draining;
+        {
+            std::lock_guard<std::mutex> lock(connections_lock);
+            for (int peer_id : peer_ids) {
+                auto it = connections.find(peer_id);
+                if (it == connections.end())
+                    continue;
+                draining.push_back({it->second.fd, peer_id, true});
+                connections.erase(it);
+            }
+        }
+
+        for (const auto &d : draining)
+            ::shutdown(d.fd, SHUT_WR);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DRAIN_BUDGET_MS);
+        char tmp[4096];
+        size_t remaining = draining.size();
+
+        while (remaining > 0) {
+            int timeout =
+                (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+                    .count();
+            if (timeout <= 0)
+                break;
+
+            std::vector<struct pollfd> pfds;
+            std::vector<Draining *> slots;
+            pfds.reserve(remaining);
+            slots.reserve(remaining);
+            for (auto &d : draining) {
+                if (!d.open)
+                    continue;
+                pfds.push_back({d.fd, POLLIN, 0});
+                slots.push_back(&d);
+            }
+
+            int r = ::poll(pfds.data(), pfds.size(), timeout);
+            if (r <= 0)
+                break; // timeout or error: stop waiting on whatever is left
+
+            for (size_t i = 0; i < pfds.size(); i++) {
+                if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                    continue;
+
+                Draining *d = slots[i];
+                while (true) {
+                    ssize_t n = ::recv(d->fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+                    if (n > 0) {
+                        std::lock_guard<std::mutex> lock(recv_buffers_lock);
+                        auto &q = recv_buffers[d->peer_id];
+                        q.insert(q.end(), tmp, tmp + n);
+                    } else if (n == 0) {
+                        d->open = false; // clean EOF: peer closed its write side
+                        break;
+                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break; // nothing more for now: keep waiting on this fd
+                    } else {
+                        d->open = false;
+                        break;
+                    }
+                }
+
+                if (!d->open) {
+                    ::close(d->fd);
+                    remaining--;
+                }
+            }
+        }
+
+        for (const auto &d : draining)
+            if (d.open)
+                ::close(d.fd);
     }
 
 } // namespace FMI::Comm

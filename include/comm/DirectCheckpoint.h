@@ -57,6 +57,7 @@ namespace FMI::Comm {
         int bind_and_listen();
         bool connect_to(int peer_id, const std::string &address, int port);
         void drain_connection(int peer_id);
+        void drain_all(const std::vector<int> &peer_ids);
     };
 } // namespace FMI::Comm
 
