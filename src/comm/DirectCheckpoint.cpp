@@ -175,8 +175,9 @@ namespace FMI::Comm {
     void DirectCheckpoint::teardown_fn() {
         shutdown.store(true);
 
-        auto metrics = common::func_metrics(std::to_string(checkpointer->get_job_id()),
-                                            std::to_string(checkpointer->get_func_id()));
+        auto metrics =
+            common::func_metrics(std::to_string(checkpointer->get_job_id()),
+                                 std::to_string(checkpointer->get_func_id()), checkpointer->get_cnt_restore());
 
         {
             auto m = metrics.start("teardown_delete_key");
@@ -336,7 +337,8 @@ namespace FMI::Comm {
         // while we were checkpointed.
         std::vector<Entry> entries;
         {
-            auto metrics = common::func_metrics(getenv("job_id"), std::to_string(func_id));
+            auto metrics = common::func_metrics(getenv("job_id"), std::to_string(func_id),
+                                                (checkpointer == nullptr) ? 0 : checkpointer->get_cnt_restore());
             auto m = metrics.start("etcd_get_entries");
             for (int attempt = 1;; attempt++) {
                 try {
@@ -575,8 +577,9 @@ namespace FMI::Comm {
         for (const auto &d : draining)
             ::shutdown(d.fd, SHUT_WR);
 
-        auto metrics = common::func_metrics(std::to_string(checkpointer->get_job_id()),
-                                            std::to_string(checkpointer->get_func_id()));
+        auto metrics =
+            common::func_metrics(std::to_string(checkpointer->get_job_id()),
+                                 std::to_string(checkpointer->get_func_id()), checkpointer->get_cnt_restore());
         auto m_drain = metrics.start("drain_all");
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(DRAIN_SAFETY_MS);
