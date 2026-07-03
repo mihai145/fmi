@@ -97,7 +97,7 @@ namespace FMI::Comm {
             }
         }
 
-        BOOST_LOG_TRIVIAL(info) << "send_object(): Sent data to " << rcpt_id;
+        // BOOST_LOG_TRIVIAL(info) << "send_object(): Sent data to " << rcpt_id;
     }
 
     void DirectCheckpoint::recv_object(channel_data buf, Utils::peer_num sender_id) {
@@ -160,7 +160,7 @@ namespace FMI::Comm {
             }
         }
 
-        BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
+        // BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
     }
 
     double DirectCheckpoint::get_latency(Utils::peer_num producer, Utils::peer_num consumer,
