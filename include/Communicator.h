@@ -126,6 +126,16 @@ namespace FMI {
             channels[channel]->allreduce(senddata, recvdata, raw_f);
         }
 
+        //! Buffer-based allreduce without Data<T> conversions. The result is written to recvbuf.
+        void allreduce_raw(channel_data sendbuf, channel_data recvbuf, raw_function f) {
+            if (sendbuf.len != recvbuf.len) {
+                throw std::runtime_error("Dimensions of send and receive data must match");
+            }
+            bool left_to_right = !(f.commutative && f.associative);
+            std::string channel = policy->get_channel({Utils::allreduce, sendbuf.len, left_to_right});
+            channels[channel]->allreduce(sendbuf, recvbuf, f);
+        }
+
         //! Inclusive prefix scan.
         /*! Depending on the associativity / commutativity of f, a different implementation for the reduction may be used.
          * However, in the same topology, the evaluation order should always be the same, irrespectively of the associativity / commutativitiy.

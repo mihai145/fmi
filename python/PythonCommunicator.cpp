@@ -1,8 +1,40 @@
 #include "PythonCommunicator.h"
 #include <utils/Common.h>
 #include <string>
+#include <cstring>
+#include <algorithm>
 #include <boost/python/extract.hpp>
 #include <iostream>
+
+namespace {
+    template<typename T>
+    raw_func elementwise_func(FMI::Utils::PythonOp op, std::size_t count) {
+        switch (op) {
+            case FMI::Utils::SUM:
+                return [count](char* a, char* b) {
+                    T* x = (T*)a; T* y = (T*)b;
+                    for (std::size_t i = 0; i < count; i++) x[i] += y[i];
+                };
+            case FMI::Utils::PROD:
+                return [count](char* a, char* b) {
+                    T* x = (T*)a; T* y = (T*)b;
+                    for (std::size_t i = 0; i < count; i++) x[i] *= y[i];
+                };
+            case FMI::Utils::MAX:
+                return [count](char* a, char* b) {
+                    T* x = (T*)a; T* y = (T*)b;
+                    for (std::size_t i = 0; i < count; i++) x[i] = std::max(x[i], y[i]);
+                };
+            case FMI::Utils::MIN:
+                return [count](char* a, char* b) {
+                    T* x = (T*)a; T* y = (T*)b;
+                    for (std::size_t i = 0; i < count; i++) x[i] = std::min(x[i], y[i]);
+                };
+            default:
+                throw std::runtime_error("allreduce_inplace only supports the built-in ops");
+        }
+    }
+}
 
 FMI::Utils::PythonCommunicator::PythonCommunicator(FMI::Utils::peer_num peer_id, FMI::Utils::peer_num num_peers, std::string config_path,
                                                    std::string comm_name, unsigned int faas_memory) {
@@ -240,6 +272,43 @@ FMI::Utils::PythonCommunicator::allreduce(const boost::python::object& src_data,
     } else {
         throw std::runtime_error("Unknown type passed");
     }
+}
+
+void FMI::Utils::PythonCommunicator::allreduce_inplace(const boost::python::object& buffer, FMI::Utils::PythonFunc f) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_C_CONTIGUOUS | PyBUF_WRITABLE | PyBUF_FORMAT) != 0) {
+        PyErr_Clear();
+        throw std::runtime_error("allreduce_inplace requires a writable, C-contiguous buffer (e.g. tensor.numpy())");
+    }
+
+    try {
+        std::string fmt = view.format ? view.format : "B";
+        raw_func func;
+        if (fmt == "f") {
+            func = elementwise_func<float>(f.op, view.len / sizeof(float));
+        } else if (fmt == "d") {
+            func = elementwise_func<double>(f.op, view.len / sizeof(double));
+        } else if (fmt == "i") {
+            func = elementwise_func<int>(f.op, view.len / sizeof(int));
+        } else {
+            throw std::runtime_error("allreduce_inplace supports float32/float64/int32 buffers, got format '" + fmt + "'");
+        }
+
+        if (inplace_scratch.size() < (std::size_t)view.len) {
+            inplace_scratch.resize(view.len);
+        }
+
+        channel_data sendbuf {(char*)view.buf, (std::size_t)view.len};
+        channel_data recvbuf {inplace_scratch.data(), (std::size_t)view.len};
+        comm->allreduce_raw(sendbuf, recvbuf, {func, true, true});
+
+        // The channel contract puts the result in recvbuf
+        std::memcpy(view.buf, inplace_scratch.data(), view.len);
+    } catch (...) {
+        PyBuffer_Release(&view);
+        throw;
+    }
+    PyBuffer_Release(&view);
 }
 
 boost::python::object

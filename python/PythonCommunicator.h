@@ -63,6 +63,9 @@ namespace FMI::Utils {
 
         boost::python::object allreduce(const boost::python::object& src_data, FMI::Utils::PythonFunc f, FMI::Utils::PythonData type);
 
+        //! Allreduce on a writable, C-contiguous buffer (e.g. tensor.numpy()). The result overwrites the buffer.
+        void allreduce_inplace(const boost::python::object& buffer, FMI::Utils::PythonFunc f);
+
         boost::python::object scan(const boost::python::object& src_data, FMI::Utils::PythonFunc f, FMI::Utils::PythonData type);
 
         void hint(FMI::Utils::Hint hint);
@@ -71,6 +74,7 @@ namespace FMI::Utils {
         std::shared_ptr<FMI::Communicator> comm;
         FMI::Utils::peer_num peer_id;
         FMI::Utils::peer_num num_peers;
+        std::vector<char> inplace_scratch;  // keep allocated across calls
 
         template<typename T> T extract_object(const boost::python::object &py_obj) {
             T val;

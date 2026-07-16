@@ -20,6 +20,7 @@ BOOST_PYTHON_MODULE(fmi)
         .def("scatter", &FMI::Utils::PythonCommunicator::scatter)
         .def("reduce", &FMI::Utils::PythonCommunicator::reduce)
         .def("allreduce", &FMI::Utils::PythonCommunicator::allreduce)
+        .def("allreduce_inplace", &FMI::Utils::PythonCommunicator::allreduce_inplace)
         .def("scan", &FMI::Utils::PythonCommunicator::scan)
         .def("hint", &FMI::Utils::PythonCommunicator::hint)
     ;
