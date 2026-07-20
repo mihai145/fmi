@@ -20,6 +20,8 @@ FMI::Comm::RedisCheckpoint::RedisCheckpoint(std::map<std::string, std::string> p
         include_infrastructure_costs = false;
     }
 
+    state.channel_type = 1; // object storage
+
     restore_fn();
 
     checkpointer = std::make_unique<checkpoint::Checkpointer>(

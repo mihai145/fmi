@@ -28,6 +28,7 @@ namespace FMI::Comm {
 
         std::unique_ptr<checkpoint::Checkpointer> checkpointer;
         std::unique_ptr<Coordinator> coordinator;
+        checkpoint::UninterruptibleContextState state{0}; // scheduler hint
 
         void teardown_fn();
         void restore_fn();
@@ -58,6 +59,29 @@ namespace FMI::Comm {
         bool connect_to(int peer_id, const std::string &address, int port);
         void drain_connection(int peer_id);
         void drain_all(const std::vector<int> &peer_ids);
+
+        // hint state helpers
+        void hint_send_wait(FMI::Utils::peer_num rcpt_id) {
+          state.waiting_for[rcpt_id] = true;
+          state.current_state = checkpoint::Send{(int)rcpt_id};
+        }
+
+        void hint_send_done(FMI::Utils::peer_num rcpt_id) {
+          state.done_send[rcpt_id]++;
+          state.waiting_for[rcpt_id] = false;
+          state.current_state = checkpoint::CPUBound{};
+        }
+
+        void hint_recv_wait(FMI::Utils::peer_num sender_id) {
+          state.waiting_for[sender_id] = true;
+          state.current_state = checkpoint::Recv{(int)sender_id};
+        }
+
+        void hint_recv_done(FMI::Utils::peer_num sender_id) {
+          state.done_recv[sender_id]++;
+          state.waiting_for[sender_id] = false;
+          state.current_state = checkpoint::CPUBound{};
+        }
     };
 } // namespace FMI::Comm
 

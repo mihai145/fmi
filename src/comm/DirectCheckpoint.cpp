@@ -38,7 +38,13 @@ namespace FMI::Comm {
         checkpoint::Checkpointer::setup_thread();
         restore_fn();
 
-        checkpointer = std::make_unique<checkpoint::Checkpointer>([this] { teardown_fn(); }, [this] { restore_fn(); });
+        state.channel_type = 2; // p2p
+        state.num_peers = std::stoi(getenv("num_peers"));
+
+        checkpointer = std::make_unique<checkpoint::Checkpointer>([this] {
+            checkpointer->register_hint(state);
+            teardown_fn();
+        }, [this] { restore_fn(); });
     }
 
     DirectCheckpoint::~DirectCheckpoint() {
@@ -50,6 +56,9 @@ namespace FMI::Comm {
             listener_thread.join();
         if (etcd_thread.joinable())
             etcd_thread.join();
+
+        if (checkpointer)
+            checkpointer->register_hint(state);
     }
 
     void DirectCheckpoint::send_object(channel_data buf, Utils::peer_num rcpt_id) {
@@ -60,6 +69,7 @@ namespace FMI::Comm {
             bool blocked = false;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                hint_send_wait(rcpt_id);
 
                 {
                     std::lock_guard<std::mutex> lock(connections_lock);
@@ -72,6 +82,7 @@ namespace FMI::Comm {
                     ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
                     if (n > 0) {
                         sent += n;
+                        if (sent == (int)buf.len) hint_send_done(rcpt_id);
                         continue;
                     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         blocked = true;
@@ -108,6 +119,7 @@ namespace FMI::Comm {
             bool blocked = false;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                hint_recv_wait(sender_id);
 
                 {
                     std::lock_guard<std::mutex> lock(recv_buffers_lock);
@@ -118,8 +130,9 @@ namespace FMI::Comm {
                         std::copy(q.begin(), q.begin() + to_copy, buf.buf + recvd);
                         q.erase(q.begin(), q.begin() + to_copy);
                         recvd += to_copy;
-
                         BOOST_LOG_TRIVIAL(info) << "recv_object(): Drained " << to_copy << " bytes from " << sender_id;
+
+                        if (recvd == (int)buf.len) hint_recv_done(sender_id);
                         continue;
                     }
                 }
@@ -135,6 +148,7 @@ namespace FMI::Comm {
                     ssize_t n = ::recv(fd, buf.buf + recvd, buf.len - recvd, MSG_DONTWAIT);
                     if (n > 0) {
                         recvd += n;
+                        if (recvd == (int)buf.len) hint_recv_done(sender_id);
                         continue;
                     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         blocked = true;
