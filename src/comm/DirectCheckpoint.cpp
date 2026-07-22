@@ -57,6 +57,15 @@ namespace FMI::Comm {
         if (etcd_thread.joinable())
             etcd_thread.join();
 
+        // remove our own key
+        if (coordinator) {
+            try {
+                coordinator->delete_own_key(func_id);
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "~DirectCheckpoint(): delete_own_key failed: " << e.what();
+            }
+        }
+
         if (checkpointer)
             checkpointer->register_hint(state);
     }
@@ -247,16 +256,17 @@ namespace FMI::Comm {
 
         listener_thread = std::thread(&DirectCheckpoint::handle_listener, this);
 
-        coordinator = std::make_unique<EtcdCoordinator>(etcd_host, etcd_port, comm_name);
+        coordinator = std::make_unique<EtcdCoordinator>(etcd_host, etcd_port, getenv("job_id"));
+        int cnt_restore = (checkpointer == nullptr) ? 0 : checkpointer->get_cnt_restore();
         for (int attempt = 1;; attempt++) {
             try {
-                coordinator->advertise_own_key(func_id, listener_port);
+                coordinator->advertise_conn(func_id, cnt_restore, listener_port);
                 break;
             } catch (const std::exception &e) {
                 if (attempt == ADVERTISE_RETRIES)
                     throw;
                 BOOST_LOG_TRIVIAL(warning)
-                    << "restore_fn(): advertise_own_key failed (attempt " << attempt << "): " << e.what();
+                    << "restore_fn(): advertise_conn failed (attempt " << attempt << "): " << e.what();
                 std::this_thread::sleep_for(std::chrono::milliseconds(ETCD_POLL_MS));
             }
         }
@@ -340,12 +350,7 @@ namespace FMI::Comm {
     }
 
     void DirectCheckpoint::handle_etcd() {
-        struct PendingRetry {
-            std::string address;
-            int port;
-            std::chrono::steady_clock::time_point next_retry;
-        };
-        std::unordered_map<int, PendingRetry> pending;
+        pending_connects.clear();
 
         // Read current state before watching so we don't miss peers that registered
         // while we were checkpointed.
@@ -372,13 +377,11 @@ namespace FMI::Comm {
             m.stop();
         }
 
+        // Dispatch the current state through the same membership callbacks as watch events.
         for (const auto &entry : entries) {
-            if (entry.func_id != func_id && func_id < entry.func_id) {
-                if (!connect_to(entry.func_id, entry.address, entry.port))
-                    pending[entry.func_id] = {entry.address, entry.port,
-                                              std::chrono::steady_clock::now() +
-                                                  std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS)};
-            }
+            if (entry.func_id == func_id)
+                continue;
+            process({entry.reachable() ? EventType::ADVERTISE_CONN : EventType::ADVERTISE_START, entry});
         }
 
         coordinator->start_watch();
@@ -386,15 +389,15 @@ namespace FMI::Comm {
         while (!shutdown.load()) {
             // next_event() blocks until an event or the timeout
             // wake often enough to retry pending connects
-            int timeout = pending.empty() ? ETCD_POLL_MS : CONNECT_TO_FAILURE_BACKOFF_MS;
+            int timeout = pending_connects.empty() ? ETCD_POLL_MS : CONNECT_TO_FAILURE_BACKOFF_MS;
             auto ev = coordinator->next_event(timeout);
 
             // handle retries first
             auto now = std::chrono::steady_clock::now();
-            for (auto it = pending.begin(); it != pending.end();) {
+            for (auto it = pending_connects.begin(); it != pending_connects.end();) {
                 if (now >= it->second.next_retry) {
                     if (connect_to(it->first, it->second.address, it->second.port)) {
-                        it = pending.erase(it);
+                        it = pending_connects.erase(it);
                     } else {
                         it->second.next_retry = now + std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS);
                         ++it;
@@ -407,45 +410,57 @@ namespace FMI::Comm {
             if (!ev)
                 continue;
 
-            const auto &entry = ev->entry;
-            if (entry.func_id == func_id)
+            if (ev->entry.func_id == func_id)
                 continue;
 
-            pending.erase(entry.func_id);
-
-            if (ev->type == EventType::PUT) {
-                BOOST_LOG_TRIVIAL(info) << "handle_etcd(): PUT event for peer " << entry.func_id << ", address "
-                                        << entry.address << ", port " << entry.port;
-
-                // only connect to peers with higher id
-                if (func_id < entry.func_id) {
-                    bool known, same;
-                    {
-                        std::lock_guard<std::mutex> lock(connections_lock);
-                        auto it = connections.find(entry.func_id);
-                        known = (it != connections.end());
-                        same = known && it->second.address == entry.address && it->second.port == entry.port;
-                    }
-
-                    if (!same) {
-                        if (known) {
-                            BOOST_LOG_TRIVIAL(info) << "handle_etcd(): PUT -> Drain connection to " << entry.func_id;
-                            drain_connection(entry.func_id);
-                        }
-
-                        BOOST_LOG_TRIVIAL(info) << "handle_etcd(): PUT -> Connect to " << entry.func_id;
-                        if (!connect_to(entry.func_id, entry.address, entry.port))
-                            pending[entry.func_id] = {entry.address, entry.port,
-                                                      now + std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS)};
-                    }
-                }
-            } else { // DELETE
-                BOOST_LOG_TRIVIAL(info) << "handle_etcd(): DELETE event for peer " << entry.func_id;
-                drain_connection(entry.func_id);
-            }
+            process(*ev);
         }
 
         BOOST_LOG_TRIVIAL(info) << "handle_etcd(): Thread stopped handling etcd";
+    }
+
+    void DirectCheckpoint::advertised_start(const Entry &entry) {
+        BOOST_LOG_TRIVIAL(info) << "advertised_start(): peer " << entry.func_id
+                                << " advertised to start (cnt_restore " << entry.cnt_restore << ")";
+    }
+
+    void DirectCheckpoint::advertised_conn(const Entry &entry) {
+        BOOST_LOG_TRIVIAL(info) << "advertised_conn(): peer " << entry.func_id << " reachable at " << *entry.address
+                                << ":" << *entry.port << " (cnt_restore " << entry.cnt_restore << ")";
+
+        pending_connects.erase(entry.func_id);
+
+        // only connect to peers with higher id
+        if (func_id >= entry.func_id)
+            return;
+
+        bool known, same;
+        {
+            std::lock_guard<std::mutex> lock(connections_lock);
+            auto it = connections.find(entry.func_id);
+            known = (it != connections.end());
+            same = known && it->second.address == *entry.address && it->second.port == *entry.port;
+        }
+
+        if (same)
+            return;
+
+        if (known) {
+            BOOST_LOG_TRIVIAL(info) << "advertised_conn(): Drain connection to " << entry.func_id;
+            drain_connection(entry.func_id);
+        }
+
+        BOOST_LOG_TRIVIAL(info) << "advertised_conn(): Connect to " << entry.func_id;
+        if (!connect_to(entry.func_id, *entry.address, *entry.port))
+            pending_connects[entry.func_id] = {*entry.address, *entry.port,
+                                               std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds(CONNECT_TO_FAILURE_BACKOFF_MS)};
+    }
+
+    void DirectCheckpoint::advertised_leave(const Entry &entry) {
+        BOOST_LOG_TRIVIAL(info) << "advertised_leave(): peer " << entry.func_id << " left";
+        pending_connects.erase(entry.func_id);
+        drain_connection(entry.func_id);
     }
 
     int DirectCheckpoint::bind_and_listen() {

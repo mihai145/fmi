@@ -5,11 +5,13 @@
 #include "PeerToPeer.h"
 #include "checkpoint_v2.hpp"
 
+#include <chrono>
 #include <deque>
+#include <unordered_map>
 
 namespace FMI::Comm {
 
-    class DirectCheckpoint : public PeerToPeer {
+    class DirectCheckpoint : public PeerToPeer, public MembershipHandler {
       public:
         explicit DirectCheckpoint(std::map<std::string, std::string> params,
                                   std::map<std::string, std::string> model_params);
@@ -54,6 +56,18 @@ namespace FMI::Comm {
 
         void handle_listener();
         void handle_etcd();
+
+        // membership callbacks, run on the etcd thread
+        void advertised_start(const Entry &entry) override;
+        void advertised_conn(const Entry &entry) override;
+        void advertised_leave(const Entry &entry) override;
+
+        struct PendingConnect {
+            std::string address;
+            int port;
+            std::chrono::steady_clock::time_point next_retry;
+        };
+        std::unordered_map<int, PendingConnect> pending_connects; // etcd thread
 
         int bind_and_listen();
         bool connect_to(int peer_id, const std::string &address, int port);

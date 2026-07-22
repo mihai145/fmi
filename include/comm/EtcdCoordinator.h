@@ -14,22 +14,50 @@ namespace FMI::Comm {
 
     struct Entry {
         int func_id;
-        std::string address;
-        int port;
+        int cnt_restore;
+        std::optional<std::string> address;
+        std::optional<int> port;
+
+        bool reachable() const { return address.has_value() && port.has_value(); }
     };
 
-    enum class EventType { PUT, DELETE };
+    enum class EventType { ADVERTISE_START, ADVERTISE_CONN, ADVERTISE_LEAVE };
 
     struct WatchEvent {
         EventType type;
         Entry entry;
     };
 
+    // Processes membership events
+    class MembershipHandler {
+      public:
+        virtual ~MembershipHandler() = default;
+
+        void process(const WatchEvent &ev) {
+            switch (ev.type) {
+            case EventType::ADVERTISE_START:
+                advertised_start(ev.entry);
+                break;
+            case EventType::ADVERTISE_CONN:
+                advertised_conn(ev.entry);
+                break;
+            case EventType::ADVERTISE_LEAVE:
+                advertised_leave(ev.entry);
+                break;
+            }
+        }
+
+      protected:
+        virtual void advertised_start(const Entry &entry) = 0;
+        virtual void advertised_conn(const Entry &entry) = 0;
+        virtual void advertised_leave(const Entry &entry) = 0;
+    };
+
     class Coordinator {
       public:
         virtual ~Coordinator() = default;
 
-        virtual void advertise_own_key(int func_id, int port) = 0;
+        virtual void advertise_conn(int func_id, int cnt_restore, int port) = 0;
         virtual void delete_own_key(int func_id) = 0;
         virtual std::vector<Entry> get_entries() = 0;
         virtual std::optional<WatchEvent> next_event(int timeout_ms) = 0;
@@ -37,12 +65,14 @@ namespace FMI::Comm {
         virtual void stop_watch() = 0;
     };
 
+    // advertised to start: "<job_id>/<func_id>:<cnt_restore>"
+    // adverised to be reachable: "<job_id>/<func_id>:<cnt_restore>:<ip>:<port>"
     class EtcdCoordinator : public Coordinator {
       public:
-        EtcdCoordinator(const std::string &etcd_host, int etcd_port, const std::string &comm_name);
+        EtcdCoordinator(const std::string &etcd_host, int etcd_port, const std::string &job_id);
         ~EtcdCoordinator() override;
 
-        void advertise_own_key(int func_id, int port) override;
+        void advertise_conn(int func_id, int cnt_restore, int port) override;
         void delete_own_key(int func_id) override;
         std::vector<Entry> get_entries() override;
         std::optional<WatchEvent> next_event(int timeout_ms) override;

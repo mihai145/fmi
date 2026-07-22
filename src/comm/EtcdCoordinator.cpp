@@ -84,6 +84,27 @@ namespace {
         return result;
     }
 
+    // value: "<cnt_restore>" or "<cnt_restore>:<ip>:<port>"
+    std::optional<FMI::Comm::Entry> parse_value(int func_id, const std::string &raw_val) {
+        try {
+            FMI::Comm::Entry e{func_id, 0, std::nullopt, std::nullopt};
+            auto c1 = raw_val.find(':');
+            if (c1 == std::string::npos) {
+                e.cnt_restore = std::stoi(raw_val);
+                return e;
+            }
+            auto c2 = raw_val.rfind(':');
+            if (c2 == c1)
+                return std::nullopt;
+            e.cnt_restore = std::stoi(raw_val.substr(0, c1));
+            e.address = raw_val.substr(c1 + 1, c2 - c1 - 1);
+            e.port = std::stoi(raw_val.substr(c2 + 1));
+            return e;
+        } catch (const std::exception &) {
+            return std::nullopt;
+        }
+    }
+
     long parse_header_revision(const std::string &json) {
         auto rp = json.find("\"revision\":\"");
         if (rp == std::string::npos)
@@ -99,17 +120,18 @@ namespace {
 
 namespace FMI::Comm {
 
-    EtcdCoordinator::EtcdCoordinator(const std::string &etcd_host, int etcd_port, const std::string &comm_name)
-        : base_url("http://" + etcd_host + ":" + std::to_string(etcd_port)), key_prefix(comm_name + "/") {
+    EtcdCoordinator::EtcdCoordinator(const std::string &etcd_host, int etcd_port, const std::string &job_id)
+        : base_url("http://" + etcd_host + ":" + std::to_string(etcd_port)), key_prefix(job_id + "/") {
         static std::once_flag init_flag;
         std::call_once(init_flag, [] { curl_global_init(CURL_GLOBAL_ALL); });
     }
 
     EtcdCoordinator::~EtcdCoordinator() { stop_watch(); }
 
-    void EtcdCoordinator::advertise_own_key(int func_id, int port) {
+    void EtcdCoordinator::advertise_conn(int func_id, int cnt_restore, int port) {
         std::string key = key_prefix + std::to_string(func_id);
-        std::string value = common::get_ethernet_ip() + ":" + std::to_string(port);
+        std::string value =
+            std::to_string(cnt_restore) + ":" + common::get_rdma_ip() + ":" + std::to_string(port);
         std::string body = R"({"key":")" + b64_encode(key) + R"(","value":")" + b64_encode(value) + "\"}";
         http_post(base_url + "/v3/kv/put", body, CURL_TIMEOUT_MS);
         BOOST_LOG_TRIVIAL(info) << "EtcdCoordinator: advertised " << key << " = " << value;
@@ -128,20 +150,20 @@ namespace FMI::Comm {
         std::string body = R"({"key":")" + b64_encode(key_prefix) + R"(","range_end":")" + b64_encode(pfx_end) + "\"}";
         std::string resp = http_post(base_url + "/v3/kv/range", body, timeout_ms);
 
-        // Remember the store revision so the watch can resume exactly after this read.
+        // store revision so the watch can resume exactly after this read
         long rev = parse_header_revision(resp);
         if (rev >= 0)
             last_revision = rev;
 
         std::vector<Entry> entries;
         for (auto &[raw_key, raw_val] : parse_kvs(resp)) {
-            // key: "comm_name/func_id", value: "ip:port"
+            // key: "job_id/func_id"
             auto slash = raw_key.rfind('/');
-            auto colon = raw_val.rfind(':');
-            if (slash == std::string::npos || colon == std::string::npos)
+            if (slash == std::string::npos)
                 continue;
-            entries.push_back(
-                {std::stoi(raw_key.substr(slash + 1)), raw_val.substr(0, colon), std::stoi(raw_val.substr(colon + 1))});
+            auto entry = parse_value(std::stoi(raw_key.substr(slash + 1)), raw_val);
+            if (entry)
+                entries.push_back(*entry);
         }
         return entries;
     }
@@ -246,12 +268,12 @@ namespace FMI::Comm {
                 if (ve == std::string::npos)
                     break;
                 std::string raw_val = b64_decode(line.substr(vp, ve - vp));
-                auto colon = raw_val.rfind(':');
-                if (colon == std::string::npos)
+                auto entry = parse_value(fid, raw_val);
+                if (!entry)
                     continue;
-                out.push_back({EventType::PUT, {fid, raw_val.substr(0, colon), std::stoi(raw_val.substr(colon + 1))}});
+                out.push_back({entry->reachable() ? EventType::ADVERTISE_CONN : EventType::ADVERTISE_START, *entry});
             } else {
-                out.push_back({EventType::DELETE, {fid, "", 0}});
+                out.push_back({EventType::ADVERTISE_LEAVE, {fid, -1, std::nullopt, std::nullopt}});
             }
         }
         return out;
