@@ -2,14 +2,18 @@
 #define FMI_REDIS_CHECKPOINT_H
 
 #include "ClientServer.h"
+#include "EtcdCoordinator.h"
+#include <atomic>
 #include <hiredis/hiredis.h>
 #include <map>
+#include <memory>
 #include <string>
+#include <thread>
 
 namespace FMI::Comm {
     //! Checkpointable channel that uses Redis with the Hiredis client library
     //! as storage backend.
-    class RedisCheckpoint : public ClientServer {
+    class RedisCheckpoint : public ClientServer, public MembershipHandler {
       public:
         explicit RedisCheckpoint(
             std::map<std::string, std::string> params,
@@ -35,6 +39,21 @@ namespace FMI::Comm {
         std::string hostname;
         int port;
         redisContext *context;
+
+        // etcd membership tracking
+        std::string etcd_host;
+        int etcd_port;
+        int func_id;
+        std::unique_ptr<Coordinator> coordinator;
+        std::atomic<bool> shutdown{false};
+        std::thread etcd_thread;
+
+        void handle_etcd();
+
+        // membership callbacks, run on the etcd thread
+        void advertised_start(const Entry &entry) override;
+        void advertised_conn(const Entry &entry) override;
+        void advertised_leave(const Entry &entry) override;
 
         // Model params
         double bandwidth_single;

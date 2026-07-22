@@ -1,12 +1,22 @@
 #include "../../include/comm/RedisCheckpoint.h"
 #include <boost/log/trivial.hpp>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+
+namespace {
+    constexpr int ETCD_POLL_MS = 200;
+    constexpr int GET_ENTRIES_RETRIES = 10;
+} // namespace
 
 FMI::Comm::RedisCheckpoint::RedisCheckpoint(std::map<std::string, std::string> params,
                                             std::map<std::string, std::string> model_params)
     : ClientServer(params) {
     hostname = params["host"];
     port = std::stoi(params["port"]);
+    etcd_host = params["etcd_host"];
+    etcd_port = std::stoi(params["etcd_port"]);
+    func_id = std::stoi(getenv("func_id"));
 
     bandwidth_single = std::stod(model_params["bandwidth_single"]);
     bandwidth_multiple = std::stod(model_params["bandwidth_multiple"]);
@@ -114,6 +124,21 @@ double FMI::Comm::RedisCheckpoint::get_price(Utils::peer_num producer, Utils::pe
 }
 
 void FMI::Comm::RedisCheckpoint::teardown_fn() {
+    shutdown.store(true);
+
+    if (coordinator) {
+        try {
+            coordinator->delete_own_key(func_id);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "teardown_fn(): delete_own_key failed: " << e.what();
+        }
+    }
+
+    if (etcd_thread.joinable())
+        etcd_thread.join();
+    if (coordinator)
+        coordinator->stop_watch();
+
     redisFree(context);
     context = nullptr;
 }
@@ -127,4 +152,63 @@ void FMI::Comm::RedisCheckpoint::restore_fn() {
             BOOST_LOG_TRIVIAL(error) << "Allocating Redis context not possible";
         }
     }
+
+    shutdown.store(false);
+    coordinator = std::make_unique<EtcdCoordinator>(etcd_host, etcd_port, getenv("job_id"));
+    etcd_thread = std::thread(&RedisCheckpoint::handle_etcd, this);
+}
+
+void FMI::Comm::RedisCheckpoint::handle_etcd() {
+    // Read current state before watching so we don't miss peers that registered
+    // while we were checkpointed.
+    std::vector<Entry> entries;
+    for (int attempt = 1;; attempt++) {
+        try {
+            entries = coordinator->get_entries();
+            break;
+        } catch (const std::exception &e) {
+            if (attempt == GET_ENTRIES_RETRIES) {
+                BOOST_LOG_TRIVIAL(error) << "handle_etcd(): get_entries failed after retries: " << e.what();
+                return;
+            }
+            BOOST_LOG_TRIVIAL(warning) << "handle_etcd(): get_entries failed (attempt " << attempt
+                                       << "): " << e.what();
+            std::this_thread::sleep_for(std::chrono::milliseconds(ETCD_POLL_MS));
+        }
+    }
+
+    for (const auto &entry : entries) {
+        if (entry.func_id == func_id)
+            continue;
+        process({entry.reachable() ? EventType::ADVERTISE_CONN : EventType::ADVERTISE_START, entry});
+    }
+
+    coordinator->start_watch();
+
+    while (!shutdown.load()) {
+        auto ev = coordinator->next_event(ETCD_POLL_MS);
+        if (!ev)
+            continue;
+
+        if (ev->entry.func_id == func_id)
+            continue;
+
+        process(*ev);
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "handle_etcd(): Thread stopped handling etcd";
+}
+
+void FMI::Comm::RedisCheckpoint::advertised_start(const Entry &entry) {
+    BOOST_LOG_TRIVIAL(info) << "advertised_start(): peer " << entry.func_id
+                            << " advertised to start (cnt_restore " << entry.cnt_restore << ")";
+}
+
+void FMI::Comm::RedisCheckpoint::advertised_conn(const Entry &entry) {
+    BOOST_LOG_TRIVIAL(info) << "advertised_conn(): peer " << entry.func_id << " reachable at " << *entry.address
+                            << ":" << *entry.port << " (cnt_restore " << entry.cnt_restore << ")";
+}
+
+void FMI::Comm::RedisCheckpoint::advertised_leave(const Entry &entry) {
+    BOOST_LOG_TRIVIAL(info) << "advertised_leave(): peer " << entry.func_id << " left";
 }

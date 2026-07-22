@@ -377,7 +377,6 @@ namespace FMI::Comm {
             m.stop();
         }
 
-        // Dispatch the current state through the same membership callbacks as watch events.
         for (const auto &entry : entries) {
             if (entry.func_id == func_id)
                 continue;
