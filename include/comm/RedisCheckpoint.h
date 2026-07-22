@@ -4,11 +4,13 @@
 #include "ClientServer.h"
 #include "EtcdCoordinator.h"
 #include <atomic>
+#include <chrono>
 #include <hiredis/hiredis.h>
 #include <map>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace FMI::Comm {
     //! Checkpointable channel that uses Redis with the Hiredis client library
@@ -54,6 +56,21 @@ namespace FMI::Comm {
         void advertised_start(const Entry &entry) override;
         void advertised_conn(const Entry &entry) override;
         void advertised_leave(const Entry &entry) override;
+
+        // Peer presence tracking
+        PeerPresence presence;
+
+        // Self-stop when every peer we are waiting on stays dead too long
+        struct StallTracker {
+            int cnt_restore{-1};
+            std::vector<int> peers;
+            std::chrono::steady_clock::time_point since;
+            bool armed{false};
+            bool triggered{false};
+        };
+        StallTracker stall;
+
+        void waiting_on(const std::vector<int> &peers) override;
 
         // Model params
         double bandwidth_single;

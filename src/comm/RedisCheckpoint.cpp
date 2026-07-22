@@ -7,6 +7,7 @@
 namespace {
     constexpr int ETCD_POLL_MS = 200;
     constexpr int GET_ENTRIES_RETRIES = 10;
+    constexpr int SELF_STOP_TIMEOUT_MS = 3000;
 } // namespace
 
 FMI::Comm::RedisCheckpoint::RedisCheckpoint(std::map<std::string, std::string> params,
@@ -143,6 +144,41 @@ void FMI::Comm::RedisCheckpoint::teardown_fn() {
     context = nullptr;
 }
 
+void FMI::Comm::RedisCheckpoint::waiting_on(const std::vector<int> &peers) {
+    if (peers.empty()) {    // wait is over
+        stall.armed = false;
+        return;
+    }
+
+    // if at least one peer is live, we can make progress
+    for (int p : peers) {
+        if (p < 0 || p >= checkpoint::MAX_PEERS || p == func_id || presence.live(p)) {
+            stall.armed = false;
+            return;
+        }
+    }
+
+    int cnt_restore = checkpointer->get_cnt_restore();
+
+    // rearm the tracker is it's not armed, the peer set has changed or we straddled a checkpoint
+    auto now = std::chrono::steady_clock::now();
+    if (!stall.armed || stall.cnt_restore != cnt_restore || stall.peers != peers) {
+        stall = {cnt_restore, peers, now, true, false};
+        return;
+    }
+
+    if (stall.triggered)
+        return;
+
+    if (now - stall.since >= std::chrono::milliseconds(SELF_STOP_TIMEOUT_MS)) {
+        BOOST_LOG_TRIVIAL(warning) << "waiting_on(): none of the " << peers.size() << " awaited peers live for "
+                                   << SELF_STOP_TIMEOUT_MS << "ms (cnt_restore " << cnt_restore
+                                   << "), triggering self stop";
+        stall.triggered = true;
+        checkpointer->self_stop(cnt_restore);
+    }
+}
+
 void FMI::Comm::RedisCheckpoint::restore_fn() {
     context = redisConnect(hostname.c_str(), port);
     if (context == nullptr || context->err) {
@@ -154,6 +190,7 @@ void FMI::Comm::RedisCheckpoint::restore_fn() {
     }
 
     shutdown.store(false);
+    presence.reset(); // repopulated from get_entries
     coordinator = std::make_unique<EtcdCoordinator>(etcd_host, etcd_port, getenv("job_id"));
     etcd_thread = std::thread(&RedisCheckpoint::handle_etcd, this);
 }
@@ -202,13 +239,16 @@ void FMI::Comm::RedisCheckpoint::handle_etcd() {
 void FMI::Comm::RedisCheckpoint::advertised_start(const Entry &entry) {
     BOOST_LOG_TRIVIAL(info) << "advertised_start(): peer " << entry.func_id
                             << " advertised to start (cnt_restore " << entry.cnt_restore << ")";
+    presence.set(entry.func_id, true);
 }
 
 void FMI::Comm::RedisCheckpoint::advertised_conn(const Entry &entry) {
     BOOST_LOG_TRIVIAL(info) << "advertised_conn(): peer " << entry.func_id << " reachable at " << *entry.address
                             << ":" << *entry.port << " (cnt_restore " << entry.cnt_restore << ")";
+    presence.set(entry.func_id, true);
 }
 
 void FMI::Comm::RedisCheckpoint::advertised_leave(const Entry &entry) {
     BOOST_LOG_TRIVIAL(info) << "advertised_leave(): peer " << entry.func_id << " left";
+    presence.set(entry.func_id, false);
 }

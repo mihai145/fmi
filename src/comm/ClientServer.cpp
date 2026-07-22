@@ -1,4 +1,5 @@
 #include "../../include/comm/ClientServer.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -76,17 +77,19 @@ void FMI::Comm::ClientServer::barrier() {
     unsigned int elapsed_time = 0;
     while (max_timeout == 0 || elapsed_time < max_timeout) {
         auto objects = get_object_names();
-        auto has_barrier_suffix = [barrier_suffix](const std::string &s) {
-            return s.size() > barrier_suffix.size() &&
-                   s.compare(s.size() - barrier_suffix.size(),
-                             barrier_suffix.size(), barrier_suffix) == 0;
-        };
-        auto num_arrived =
-            std::count_if(objects.begin(), objects.end(), has_barrier_suffix);
-        if (num_arrived >= num_peers) {
+        std::vector<int> missing;
+        for (int i = 0; i < (int)num_peers; i++) {
+            std::string expected = comm_name + std::to_string(i) + barrier_suffix;
+            if (std::find(objects.begin(), objects.end(), expected) ==
+                objects.end()) {
+                missing.push_back(i);
+            }
+        }
+        if (missing.empty()) {
             exit_state(checkpoint::Barrier{});
             return;
         } else {
+            waiting_on(missing);
             elapsed_time += timeout;
             std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
         }
@@ -97,12 +100,19 @@ void FMI::Comm::ClientServer::barrier() {
 void FMI::Comm::ClientServer::finalize() { created_objects.clear(); }
 
 void FMI::Comm::ClientServer::download(channel_data buf, std::string name) {
+    int producer = -1;  // the producing peer id is the first integer after the comm name
+    try {
+        producer = std::stoi(name.substr(comm_name.size()));
+    } catch (...) {
+    }
+
     unsigned int elapsed_time = 0;
     while (max_timeout == 0 || elapsed_time < max_timeout) {
         bool success = download_object(buf, name);
         if (success) {
             return;
         } else {
+            waiting_on({producer});
             elapsed_time += timeout;
             std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
         }
@@ -158,6 +168,17 @@ void FMI::Comm::ClientServer::reduce(channel_data sendbuf, channel_data recvbuf,
                 } else if (!received[i]) {
                     all_left_applied = false;
                 }
+            }
+
+            // self-checkpoint check
+            std::vector<int> missing;
+            for (int i = 0; i < num_peers; i++) {
+                if (!received[i]) {
+                    missing.push_back(i);
+                }
+            }
+            if (!missing.empty()) {
+                waiting_on(missing);
             }
 
             elapsed_time += timeout;
@@ -217,7 +238,7 @@ void FMI::Comm::ClientServer::scan(channel_data sendbuf, channel_data recvbuf,
         }
         // Apply function where possible
         bool all_left_applied = true;
-        for (int i = 0; i < num_peers; i++) {
+        for (int i = 0; i < num_data; i++) {
             if (received[i] && !applied[i] &&
                 (!left_to_right || all_left_applied)) {
                 f.f(recvbuf.buf, data.data() + i * buffer_length);
@@ -225,6 +246,17 @@ void FMI::Comm::ClientServer::scan(channel_data sendbuf, channel_data recvbuf,
             } else if (!received[i]) {
                 all_left_applied = false;
             }
+        }
+
+        // self-checkpoint check
+        std::vector<int> missing;
+        for (int i = 0; i < num_data; i++) {
+            if (!received[i]) {
+                missing.push_back(i);
+            }
+        }
+        if (!missing.empty()) {
+            waiting_on(missing);
         }
 
         elapsed_time += timeout;
@@ -314,6 +346,8 @@ double FMI::Comm::ClientServer::get_operation_price(
 }
 
 void FMI::Comm::ClientServer::enter_state(checkpoint::CommPattern op) {
+    waiting_on({});
+
     auto ctx = checkpointer->get_uninterruptible_context();
 
     for (int i = 0; i < (int)num_peers; i++)
@@ -323,6 +357,8 @@ void FMI::Comm::ClientServer::enter_state(checkpoint::CommPattern op) {
 }
 
 void FMI::Comm::ClientServer::exit_state(checkpoint::CommPattern op) {
+    waiting_on({});
+
     auto ctx = checkpointer->get_uninterruptible_context();
 
     for (int i = 0; i < (int)num_peers; i++)

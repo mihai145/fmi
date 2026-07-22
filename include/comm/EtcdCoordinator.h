@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -26,6 +27,31 @@ namespace FMI::Comm {
     struct WatchEvent {
         EventType type;
         Entry entry;
+    };
+
+    // Presence bitmap over func_ids
+    // Written by the etcd thread on events, read by the main thread
+    class PeerPresence {
+      public:
+        void reset() { bits.store(0, std::memory_order_relaxed); }
+
+        void set(int func_id, bool live) {
+            if (func_id < 0 || func_id >= 64)
+                return;
+            if (live)
+                bits.fetch_or(1ULL << func_id, std::memory_order_relaxed);
+            else
+                bits.fetch_and(~(1ULL << func_id), std::memory_order_relaxed);
+        }
+
+        bool live(int func_id) const {
+            if (func_id < 0 || func_id >= 64)
+                return false;
+            return (bits.load(std::memory_order_relaxed) >> func_id) & 1;
+        }
+
+      private:
+        std::atomic<uint64_t> bits{0};
     };
 
     // Processes membership events

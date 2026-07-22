@@ -25,6 +25,7 @@ namespace {
     constexpr int POLL_TIMEOUT_MS = 100;
     constexpr int ADVERTISE_RETRIES = 10;
     constexpr int CONNECT_TO_FAILURE_BACKOFF_MS = 100;
+    constexpr int SELF_STOP_TIMEOUT_MS = 3000;
 } // namespace
 
 namespace FMI::Comm {
@@ -76,8 +77,10 @@ namespace FMI::Comm {
         while (sent < (int)buf.len) {
             int fd = -1;
             bool blocked = false;
+            int cnt_restore = 0;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                cnt_restore = checkpointer->get_cnt_restore();
                 hint_send_wait(rcpt_id);
 
                 {
@@ -90,6 +93,7 @@ namespace FMI::Comm {
                 if (fd != -1) {
                     ssize_t n = ::send(fd, buf.buf + sent, buf.len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
                     if (n > 0) {
+                        stall_reset();
                         sent += n;
                         if (sent == (int)buf.len) hint_send_done(rcpt_id);
                         continue;
@@ -109,9 +113,11 @@ namespace FMI::Comm {
                 }
             }
 
-            if (fd == -1)
+            if (fd == -1) {
+                stall_check(rcpt_id, cnt_restore);
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
-            else if (blocked) {
+            } else if (blocked) {
+                stall_reset();
                 struct pollfd pfd{fd, POLLOUT, 0};
                 ::poll(&pfd, 1, POLL_TIMEOUT_MS);
             }
@@ -126,8 +132,10 @@ namespace FMI::Comm {
         while (recvd < (int)buf.len) {
             int fd = -1;
             bool blocked = false;
+            int cnt_restore = 0;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                cnt_restore = checkpointer->get_cnt_restore();
                 hint_recv_wait(sender_id);
 
                 {
@@ -139,6 +147,7 @@ namespace FMI::Comm {
                         std::copy(q.begin(), q.begin() + to_copy, buf.buf + recvd);
                         q.erase(q.begin(), q.begin() + to_copy);
                         recvd += to_copy;
+                        stall_reset();
                         BOOST_LOG_TRIVIAL(info) << "recv_object(): Drained " << to_copy << " bytes from " << sender_id;
 
                         if (recvd == (int)buf.len) hint_recv_done(sender_id);
@@ -156,6 +165,7 @@ namespace FMI::Comm {
                 if (fd != -1) {
                     ssize_t n = ::recv(fd, buf.buf + recvd, buf.len - recvd, MSG_DONTWAIT);
                     if (n > 0) {
+                        stall_reset();
                         recvd += n;
                         if (recvd == (int)buf.len) hint_recv_done(sender_id);
                         continue;
@@ -175,15 +185,41 @@ namespace FMI::Comm {
                 }
             }
 
-            if (fd == -1)
+            if (fd == -1) {
+                stall_check(sender_id, cnt_restore);
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
-            else if (blocked) {
+            } else if (blocked) {
+                stall_reset();
                 struct pollfd pfd{fd, POLLIN, 0};
                 ::poll(&pfd, 1, POLL_TIMEOUT_MS);
             }
         }
 
         // BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
+    }
+
+    void DirectCheckpoint::stall_check(int peer, int cnt_restore) {
+        if (presence.live(peer)) {  // disarm the tracker if the peer is alive
+            stall_reset();
+            return;
+        }
+
+        // rearm the tracker is it's not armed, the peer has changed or we straddled a checkpoint
+        auto now = std::chrono::steady_clock::now();
+        if (!stall.armed || stall.peer != peer || stall.cnt_restore != cnt_restore) {
+            stall = {cnt_restore, peer, now, true, false};
+            return;
+        }
+
+        if (stall.triggered)
+            return;
+
+        if (now - stall.since >= std::chrono::milliseconds(SELF_STOP_TIMEOUT_MS)) {
+            BOOST_LOG_TRIVIAL(warning) << "stall_check(): peer " << peer << " not live for " << SELF_STOP_TIMEOUT_MS
+                                       << "ms (cnt_restore " << cnt_restore << "), triggering self stop";
+            stall.triggered = true;
+            checkpointer->self_stop(cnt_restore);
+        }
     }
 
     double DirectCheckpoint::get_latency(Utils::peer_num producer, Utils::peer_num consumer,
@@ -246,6 +282,7 @@ namespace FMI::Comm {
 
     void DirectCheckpoint::restore_fn() {
         shutdown.store(false);
+        presence.reset(); // repopulated from get_entries
 
         listener_port = bind_and_listen();
         if (listener_port == -1) {
@@ -421,12 +458,14 @@ namespace FMI::Comm {
     void DirectCheckpoint::advertised_start(const Entry &entry) {
         BOOST_LOG_TRIVIAL(info) << "advertised_start(): peer " << entry.func_id
                                 << " advertised to start (cnt_restore " << entry.cnt_restore << ")";
+        presence.set(entry.func_id, true);
     }
 
     void DirectCheckpoint::advertised_conn(const Entry &entry) {
         BOOST_LOG_TRIVIAL(info) << "advertised_conn(): peer " << entry.func_id << " reachable at " << *entry.address
                                 << ":" << *entry.port << " (cnt_restore " << entry.cnt_restore << ")";
 
+        presence.set(entry.func_id, true);
         pending_connects.erase(entry.func_id);
 
         // only connect to peers with higher id
@@ -458,6 +497,7 @@ namespace FMI::Comm {
 
     void DirectCheckpoint::advertised_leave(const Entry &entry) {
         BOOST_LOG_TRIVIAL(info) << "advertised_leave(): peer " << entry.func_id << " left";
+        presence.set(entry.func_id, false);
         pending_connects.erase(entry.func_id);
         drain_connection(entry.func_id);
     }

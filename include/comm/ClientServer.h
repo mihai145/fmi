@@ -4,6 +4,7 @@
 #include "../utils/Common.h"
 #include "Channel.h"
 #include <map>
+#include <vector>
 
 #include "checkpoint_v2.hpp"
 
@@ -103,6 +104,10 @@ namespace FMI::Comm {
 
         void enter_state(checkpoint::CommPattern op);
         void exit_state(checkpoint::CommPattern op);
+
+        //! Called from the polling loops with the peers whose objects have not appeared yet
+        //! and with an empty vector when the wait is over.
+        virtual void waiting_on(const std::vector<int> &peers) {}
     };
 } // namespace FMI::Comm
 

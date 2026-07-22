@@ -69,6 +69,22 @@ namespace FMI::Comm {
         };
         std::unordered_map<int, PendingConnect> pending_connects; // etcd thread
 
+        // Peer presence tracking
+        PeerPresence presence;
+
+        // Self-stop when a peer we must talk to stays dead too long
+        struct StallTracker {
+            int cnt_restore{-1};
+            int peer{-1};
+            std::chrono::steady_clock::time_point since;
+            bool armed{false};
+            bool triggered{false};
+        };
+        StallTracker stall;
+
+        void stall_reset() { stall.armed = false; }
+        void stall_check(int peer, int cnt_restore);
+
         int bind_and_listen();
         bool connect_to(int peer_id, const std::string &address, int port);
         void drain_connection(int peer_id);
