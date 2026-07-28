@@ -1,11 +1,14 @@
 #include "../../include/comm/Channel.h"
-#include "../../include/comm/Direct.h"
 #include "../../include/comm/DirectCheckpoint.h"
+
+#include <cstring>
+#include <stdexcept>
+
+#if FMI_ALL_CHANNELS
+#include "../../include/comm/Direct.h"
+#include "../../include/comm/Rdma.h"
 #include "../../include/comm/Redis.h"
 #include "../../include/comm/S3.h"
-
-#if FMI_RDMA
-#include "../../include/comm/Rdma.h"
 #endif
 
 #if LINK_WITH_CHECKPOINTING_LIB
@@ -15,28 +18,29 @@
 std::shared_ptr<FMI::Comm::Channel> FMI::Comm::Channel::get_channel(std::string name,
                                                                     std::map<std::string, std::string> params,
                                                                     std::map<std::string, std::string> model_params) {
+#if FMI_ALL_CHANNELS
     if (name == "S3") {
         return std::make_shared<S3>(params, model_params);
-    } else if (name == "Redis") {
+    }
+    if (name == "Redis") {
         return std::make_shared<Redis>(params, model_params);
-    } else if (name == "Direct") {
+    }
+    if (name == "Direct") {
         return std::make_shared<Direct>(params, model_params);
     }
-#if FMI_RDMA
-    else if (name == "Rdma") {
+    if (name == "Rdma") {
         return std::make_shared<Rdma>(params);
     }
 #endif
 #if LINK_WITH_CHECKPOINTING_LIB
-    else if (name == "RedisCheckpoint") {
+    if (name == "RedisCheckpoint") {
         return std::make_shared<RedisCheckpoint>(params, model_params);
-    } else if (name == "DirectCheckpoint") {
+    }
+    if (name == "DirectCheckpoint") {
         return std::make_shared<DirectCheckpoint>(params, model_params);
     }
 #endif
-    else {
-        throw std::runtime_error("Unknown channel name passed");
-    }
+    throw std::runtime_error("Unknown channel name passed");
 }
 
 void FMI::Comm::Channel::gather(channel_data sendbuf, channel_data recvbuf, FMI::Utils::peer_num root) {
