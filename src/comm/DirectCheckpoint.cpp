@@ -346,6 +346,9 @@ namespace FMI::Comm {
                     struct timeval tv{0, RCVTIMEO_US};
                     setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+                    int one = 1;
+                    setsockopt(new_fd, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+
                     struct epoll_event nev{};
                     nev.events = EPOLLIN;
                     nev.data.fd = new_fd;
@@ -575,6 +578,9 @@ namespace FMI::Comm {
 
         struct timeval tv{0, RCVTIMEO_US};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        int one = 1;
+        setsockopt(fd, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
 
         if (::send(fd, &func_id, sizeof(func_id), 0) != sizeof(func_id)) {
             BOOST_LOG_TRIVIAL(warning) << "connect_to(): failed send() for peer " << peer_id;
