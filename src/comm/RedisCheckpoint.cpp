@@ -1,4 +1,7 @@
 #include "../../include/comm/RedisCheckpoint.h"
+
+#include "utils.hpp"
+
 #include <boost/log/trivial.hpp>
 #include <chrono>
 #include <cmath>
@@ -52,7 +55,9 @@ FMI::Comm::RedisCheckpoint::~RedisCheckpoint() {
 void FMI::Comm::RedisCheckpoint::upload_object(channel_data buf, std::string name) {
     auto ctx = checkpointer->get_uninterruptible_context();
     std::string command = "SET " + name + " %b";
+    double start_ms = common::now_monotonic_ms();
     auto *reply = (redisReply *)redisCommand(context, command.c_str(), buf.buf, buf.len);
+    account_query(start_ms);
     bool ok = reply->type != REDIS_REPLY_ERROR;
     if (!ok)
         BOOST_LOG_TRIVIAL(error) << "Error when uploading to Redis: " << reply->str;
@@ -62,7 +67,9 @@ void FMI::Comm::RedisCheckpoint::upload_object(channel_data buf, std::string nam
 bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf, std::string name) {
     auto ctx = checkpointer->get_uninterruptible_context();
     std::string command = "GET " + name;
+    double start_ms = common::now_monotonic_ms();
     auto *reply = (redisReply *)redisCommand(context, command.c_str());
+    account_query(start_ms);
     bool ok = reply->type != REDIS_REPLY_NIL && reply->type != REDIS_REPLY_ERROR;
     if (ok)
         std::memcpy(buf.buf, reply->str, std::min(buf.len, reply->len));
@@ -81,7 +88,9 @@ bool FMI::Comm::RedisCheckpoint::download_object(channel_data buf, std::string n
 void FMI::Comm::RedisCheckpoint::delete_object(std::string name) {
     auto ctx = checkpointer->get_uninterruptible_context();
     std::string command = "DEL " + name;
+    double start_ms = common::now_monotonic_ms();
     auto *reply = (redisReply *)redisCommand(context, command.c_str());
+    account_query(start_ms);
     freeReplyObject(reply);
 }
 
@@ -89,7 +98,9 @@ std::vector<std::string> FMI::Comm::RedisCheckpoint::get_object_names() {
     auto ctx = checkpointer->get_uninterruptible_context();
     std::vector<std::string> keys;
     std::string command = "KEYS *";
+    double start_ms = common::now_monotonic_ms();
     auto *reply = (redisReply *)redisCommand(context, command.c_str());
+    account_query(start_ms);
     for (int i = 0; i < reply->elements; i++) {
         keys.emplace_back(reply->element[i]->str);
     }
@@ -142,9 +153,42 @@ void FMI::Comm::RedisCheckpoint::teardown_fn() {
 
     redisFree(context);
     context = nullptr;
+
+    publish_wait();
+}
+
+void FMI::Comm::RedisCheckpoint::wait_tick(bool waiting) {
+    auto ctx = checkpointer->get_uninterruptible_context();
+
+    auto now = std::chrono::steady_clock::now();
+    int cnt_restore = checkpointer->get_cnt_restore();
+
+    // an interval straddling a checkpoint is suspension, not blocked time
+    if (wait.armed && wait.cnt_restore == cnt_restore)
+        wait_ms += std::chrono::duration<double, std::milli>(now - wait.since).count();
+
+    wait = {waiting, cnt_restore, now};
+}
+
+void FMI::Comm::RedisCheckpoint::account_query(double start_ms) {
+    redis_ms += common::now_monotonic_ms() - start_ms;
+    redis_queries++;
+}
+
+void FMI::Comm::RedisCheckpoint::publish_wait() {
+    auto metrics = common::func_metrics(getenv("job_id"), std::to_string(func_id),
+                                        checkpointer->get_cnt_restore());
+    metrics.log("comm_blocked", {{"blocked_ms", std::to_string(wait_ms)}});
+    metrics.log("redis_time", {{"redis_ms", std::to_string(redis_ms)},
+                               {"queries", std::to_string(redis_queries)}});
+    wait_ms = 0;
+    redis_ms = 0;
+    redis_queries = 0;
 }
 
 void FMI::Comm::RedisCheckpoint::waiting_on(const std::vector<int> &peers) {
+    wait_tick(!peers.empty());
+
     if (peers.empty()) {    // wait is over
         stall.armed = false;
         return;
@@ -180,7 +224,9 @@ void FMI::Comm::RedisCheckpoint::waiting_on(const std::vector<int> &peers) {
 }
 
 void FMI::Comm::RedisCheckpoint::restore_fn() {
+    double start_ms = common::now_monotonic_ms();
     context = redisConnect(hostname.c_str(), port);
+    account_query(start_ms);
     if (context == nullptr || context->err) {
         if (context) {
             BOOST_LOG_TRIVIAL(error) << "Error when connecting to Redis: " << context->errstr;

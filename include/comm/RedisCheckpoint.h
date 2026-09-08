@@ -72,6 +72,22 @@ namespace FMI::Comm {
 
         void waiting_on(const std::vector<int> &peers) override;
 
+        // Time blocked in the polling loops and time spent in Redis queries
+        double wait_ms{0};
+        double redis_ms{0};
+        unsigned long long redis_queries{0};
+
+        struct WaitTracker {
+            bool armed{false};
+            int cnt_restore{-1};
+            std::chrono::steady_clock::time_point since;
+        };
+        WaitTracker wait;
+
+        void wait_tick(bool waiting);
+        void account_query(double start_ms);
+        void publish_wait();
+
         // Model params
         double bandwidth_single;
         double bandwidth_multiple;

@@ -34,6 +34,11 @@ namespace FMI::Comm {
 
         void teardown_fn();
         void restore_fn();
+        void publish_wait();
+
+        double wait_ms{0};
+        double comm_ms{0};
+        unsigned long long comm_calls{0};
 
         std::atomic<bool> shutdown{false};
         int listener_port{-1};

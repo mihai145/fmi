@@ -26,6 +26,18 @@ namespace {
     constexpr int ADVERTISE_RETRIES = 10;
     constexpr int CONNECT_TO_FAILURE_BACKOFF_MS = 100;
     constexpr int SELF_STOP_TIMEOUT_MS = 3000;
+
+    struct CommTimer {
+        double &comm_ms;
+        unsigned long long &comm_calls;
+        std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+
+        ~CommTimer() {
+            comm_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            comm_calls++;
+        }
+    };
 } // namespace
 
 namespace FMI::Comm {
@@ -67,12 +79,16 @@ namespace FMI::Comm {
             }
         }
 
-        if (checkpointer)
+        if (checkpointer) {
             checkpointer->register_hint(state);
+            publish_wait();
+        }
     }
 
     void DirectCheckpoint::send_object(channel_data buf, Utils::peer_num rcpt_id) {
         int sent = 0;
+        double waited = 0;
+        int waited_at = -1;
 
         while (sent < (int)buf.len) {
             int fd = -1;
@@ -80,7 +96,10 @@ namespace FMI::Comm {
             int cnt_restore = 0;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                CommTimer timer{comm_ms, comm_calls};
                 cnt_restore = checkpointer->get_cnt_restore();
+                if (waited_at == cnt_restore)
+                    wait_ms += waited;
                 hint_send_wait(rcpt_id);
 
                 {
@@ -113,6 +132,7 @@ namespace FMI::Comm {
                 }
             }
 
+            auto wait_start = std::chrono::steady_clock::now();
             if (fd == -1) {
                 stall_check(rcpt_id, cnt_restore);
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
@@ -121,6 +141,8 @@ namespace FMI::Comm {
                 struct pollfd pfd{fd, POLLOUT, 0};
                 ::poll(&pfd, 1, POLL_TIMEOUT_MS);
             }
+            waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+            waited_at = cnt_restore;
         }
 
         // BOOST_LOG_TRIVIAL(info) << "send_object(): Sent data to " << rcpt_id;
@@ -128,6 +150,8 @@ namespace FMI::Comm {
 
     void DirectCheckpoint::recv_object(channel_data buf, Utils::peer_num sender_id) {
         int recvd = 0;
+        double waited = 0;
+        int waited_at = -1;
 
         while (recvd < (int)buf.len) {
             int fd = -1;
@@ -135,7 +159,10 @@ namespace FMI::Comm {
             int cnt_restore = 0;
             {
                 auto ctx = checkpointer->get_uninterruptible_context();
+                CommTimer timer{comm_ms, comm_calls};
                 cnt_restore = checkpointer->get_cnt_restore();
+                if (waited_at == cnt_restore)
+                    wait_ms += waited;
                 hint_recv_wait(sender_id);
 
                 {
@@ -185,6 +212,7 @@ namespace FMI::Comm {
                 }
             }
 
+            auto wait_start = std::chrono::steady_clock::now();
             if (fd == -1) {
                 stall_check(sender_id, cnt_restore);
                 std::this_thread::sleep_for(std::chrono::milliseconds(MISSING_CONN_SLEEP_MS));
@@ -193,6 +221,8 @@ namespace FMI::Comm {
                 struct pollfd pfd{fd, POLLIN, 0};
                 ::poll(&pfd, 1, POLL_TIMEOUT_MS);
             }
+            waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+            waited_at = cnt_restore;
         }
 
         // BOOST_LOG_TRIVIAL(info) << "recv_object(): Recvd data from " << sender_id;
@@ -229,6 +259,18 @@ namespace FMI::Comm {
 
     double DirectCheckpoint::get_price(Utils::peer_num producer, Utils::peer_num consumer, std::size_t size_in_bytes) {
         return -1;
+    }
+
+    void DirectCheckpoint::publish_wait() {
+        auto metrics =
+            common::func_metrics(std::to_string(checkpointer->get_job_id()),
+                                 std::to_string(checkpointer->get_func_id()), checkpointer->get_cnt_restore());
+        metrics.log("comm_blocked", {{"blocked_ms", std::to_string(wait_ms)}});
+        metrics.log("comm_time", {{"comm_ms", std::to_string(comm_ms)},
+                                  {"calls", std::to_string(comm_calls)}});
+        wait_ms = 0;
+        comm_ms = 0;
+        comm_calls = 0;
     }
 
     void DirectCheckpoint::teardown_fn() {
@@ -278,6 +320,8 @@ namespace FMI::Comm {
             drain_all(peer_ids);
             m.stop();
         }
+
+        publish_wait();
     }
 
     void DirectCheckpoint::restore_fn() {
